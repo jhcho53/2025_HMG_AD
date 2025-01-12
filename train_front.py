@@ -2,98 +2,83 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import DataLoader as TorchDataLoader  # 예시
+from torch.utils.data import DataLoader as TorchDataLoader 
 from dataloader.dataloader_front import DataLoader
-from models.model_front import FeatureExtractor, EGOFeatureExtractor, CombinedMLP  # 여기서 import
+from models.model_front import FullE2EModel 
 
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
     base_root = "/home/jaehyeon/Desktop/VIPLAB/HD_E2E"
-    map_name = "R_KR_PG_KATRI__HMG"  # 처리할 Map 이름
+    map_name = "R_KR_PG_KATRI__HMG"
     batch_size = 32
     num_epochs = 10
     learning_rate = 1e-3
 
-    # 데이터 로더 초기화 (예시)
+    # 데이터 로더 초기화
     data_loader = DataLoader(base_root, map_name, batch_size=batch_size)
 
-    # 특징 추출기 및 MLP 모델 초기화
-    feature_extractor = FeatureExtractor(batch_size=batch_size)
-    ego_feature_extractor = EGOFeatureExtractor(
-        ego_input_dim=29,  # 상태 + 경로 입력 차원
-        hidden_dim=64,
-        ego_feature_dim=128
-    )
-    combined_mlp = CombinedMLP(
-        image_feature_dim=512,
+    # 통합 모델 초기화
+    full_model = FullE2EModel(
+        batch_size=batch_size,
+        ego_input_dim=29,
+        ego_hidden_dim=64,
         ego_feature_dim=128,
-        hidden_dim=128,
+        image_feature_dim=512, # ResNet18 특징 차원
+        mlp_hidden_dim=128,
         output_dim=3
-    )
+    ).to(device)  # 모델을 GPU로 이동
+    full_model.train()
 
-    # 학습 모드로 설정
-    ego_feature_extractor.train()
-    combined_mlp.train()
-
-    # 손실 함수 및 옵티마이저
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(
-        list(ego_feature_extractor.parameters()) + list(combined_mlp.parameters()), 
-        lr=learning_rate
-    )
+    optimizer = torch.optim.Adam(full_model.parameters(), lr=learning_rate)
 
-    # 모델 저장 경로
     save_path = "/home/jaehyeon/Desktop/VIPLAB/HD_E2E/sample"
     os.makedirs(save_path, exist_ok=True)
 
-    # 모든 Scenario 처리 및 학습
     for scenario_path in data_loader.scenario_paths:
-        # 시나리오 세팅
         data_loader.set_scenario(scenario_path)
         print(f"Training on Map: {map_name}, Scenario: {data_loader.current_scenario}")
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
 
-            # 예시: data_loader에서 (camera_images, ego_inputs, gt_data)를 yield하는 구조
             for camera_images, ego_inputs, gt_data in data_loader:
-                # 이미지 특징 추출
-                image_features = feature_extractor.extract_features(camera_images)
+                # camera_images -> PyTorch Tensor 변환 & GPU 이동
+                camera_images = torch.tensor(camera_images, dtype=torch.float32).to(device)
+                # permute(차원 변경):
+                camera_images = camera_images.permute(0, 3, 1, 2)  # (N,H,W,C)->(N,C,H,W) , (32, 224, 224, 3)
 
-                # EGO 입력 벡터 (현재 상태와 Global Path 포함)
-                ego_inputs_with_path = torch.tensor(ego_inputs, dtype=torch.float32)
+                # ego_inputs -> PyTorch Tensor 변환 & GPU 이동
+                ego_inputs_tensor = torch.tensor(ego_inputs, dtype=torch.float32).to(device)
 
-                # EGO 특징 추출
-                ego_features = ego_feature_extractor(ego_inputs_with_path)
+                # gt_data -> PyTorch Tensor 변환 & GPU 이동
+                target = torch.tensor(gt_data, dtype=torch.float32).to(device)
 
-                # 배치 크기 불일치 처리 (데이터셋에서 잘리는 경우 등)
-                min_batch_size = min(image_features.size(0), ego_features.size(0), gt_data.shape[0])
-                image_features = image_features[:min_batch_size]
-                ego_features = ego_features[:min_batch_size]
-                gt_data = gt_data[:min_batch_size]
+                # 모델 Forward
+                predictions = full_model(camera_images, ego_inputs_tensor)
 
-                # 모델 추론
-                predictions = combined_mlp(image_features, ego_features)
-                
+                # 패딩 때문에 shapes가 다를 경우 슬라이싱
+                min_batch_size = min(predictions.shape[0], target.shape[0])
+                predictions = predictions[:min_batch_size]
+                target = target[:min_batch_size]
+
                 # 손실 계산
-                target = torch.tensor(gt_data, dtype=torch.float32)
                 loss = criterion(predictions, target)
 
-                # 옵티마이저 업데이트
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
                 epoch_loss += loss.item()
 
-            print(f"Scenario: {data_loader.current_scenario}, Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+            print(f"Scenario: {data_loader.current_scenario}, "
+                  f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
 
-    # 학습 완료 후 모델 저장
-    torch.save(ego_feature_extractor.state_dict(), os.path.join(save_path, "ego_feature_extractor.pth"))
-    torch.save(combined_mlp.state_dict(), os.path.join(save_path, "combined_mlp.pth"))
-    
+    torch.save(full_model.state_dict(), os.path.join(save_path, "full_e2e_model.pth"))
     print("Training complete! Model saved at:")
-    print(f" - EGO Feature Extractor: {os.path.join(save_path, 'ego_feature_extractor.pth')}")
-    print(f" - Combined MLP: {os.path.join(save_path, 'combined_mlp.pth')}")
+    print(f" - Full E2E Model: {os.path.join(save_path, 'full_e2e_model.pth')}")
 
 if __name__ == "__main__":
     main()
