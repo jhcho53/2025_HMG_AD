@@ -8,10 +8,6 @@ from typing import List
 
 from utils.backbones.efficientnet import EfficientNetExtractor
 
-####################################
-# 1) 기존 코드 (질문 본문 속 내용)
-####################################
-
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
 
@@ -486,10 +482,6 @@ class SequenceEncoder(nn.Module):
         # 4) 시간축 Transformer -> (B, T, D, H_bev, W_bev)
         fused_bev = self.temporal_module(bev_seq)
         return fused_bev
-
-####################################
-# 3) 테스트 실행
-####################################
 
 if __name__ == "__main__":
     # 예) B=2, T=4, N=3, C=3, H=224, W=480
