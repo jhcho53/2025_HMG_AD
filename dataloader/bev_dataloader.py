@@ -136,9 +136,13 @@ class MultiCamDataLoader:
 
 
     def _load_camera_image(self, camera_file_path):
-        """Load camera image and preprocess it."""
+        """
+        Load camera image and preprocess it.
+        Original image shape: (720, 1280, 3)
+        Resized image shape: (224, 480, 3)
+        """
         image = cv2.imread(camera_file_path)
-        image = cv2.resize(image, self.img_size)
+        image = cv2.resize(image, (480, 224))
         image = image / 255.0  # Normalize to [0, 1]
         return image.transpose(2, 0, 1)  # Convert to (C, H, W)
 
