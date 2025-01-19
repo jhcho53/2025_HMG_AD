@@ -58,9 +58,3 @@ class BEVDecoderWithStackedGRU(nn.Module):
         # Pass through Stacked GRU
         control_command = self.stacked_gru(resnet_features)
         return control_command
-
-# Example usage
-model = BEVDecoderWithStackedGRU(input_channels=2, hidden_size=128, seq_len=32, spatial_dim=50, num_layers=3)
-input_tensor = torch.randn(1, 32, 2, 50, 50)  # [Batch, Time, Channels, Height, Width]
-output = model(input_tensor)
-print(output.shape)  # torch.Size([1, 3])
