@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 
 class MultiCamDataLoader:
-    def __init__(self, base_root, map_name, camera_dirs, batch_size=32, img_size=(224, 480), time_steps=4):
+    def __init__(self, base_root, map_name, camera_dirs, hd_map_dir, batch_size=32, img_size=(224, 480), time_steps=4, map_size=(256, 256)):
         """
         Args:
             base_root: 데이터셋 루트 경로
@@ -18,6 +18,7 @@ class MultiCamDataLoader:
         self.base_root = base_root
         self.map_name = map_name
         self.camera_dirs = camera_dirs
+        self.hd_map_dir = hd_map_dir
         self.batch_size = batch_size
         self.img_size = img_size
         self.time_steps = time_steps
@@ -25,10 +26,12 @@ class MultiCamDataLoader:
         self.all_camera_files = {}
         self.ego_frames = {}
         self.matched_frames = []
+        self.map_size = map_size
         self.calibration_data = {}  # Calibration 데이터를 저장할 딕셔너리
         self._load_calibration_data()
         self.current_scenario = None
         self.global_path = None
+        self.hd_map_data = None
         self._load_scenarios()
         self.device = "cuda"
 
@@ -56,15 +59,20 @@ class MultiCamDataLoader:
 
     def set_scenario(self, scenario_path):
         """Set the current scenario and prepare data."""
+        print(f"Setting scenario: {scenario_path}")  # 디버깅 출력
         self.current_scenario = os.path.basename(scenario_path)  # Scenario 이름
         self.base_path = scenario_path
         self.ego_info_path = os.path.join(self.base_path, "EGO_INFO")
+        self.hd_map_data = self._load_hd_map(scenario_path)
+        print(f"EGO_INFO path: {self.ego_info_path}")  # 디버깅 출력
         self.all_camera_files = {}
         self.ego_frames = {}
         self.matched_frames = []
         self._load_data()
         self.match_data()
-
+        print("--------------")
+        
+    
         # Load Global Path
         global_path_file = os.path.join(scenario_path, "global_path.csv")
         if os.path.exists(global_path_file):
@@ -72,6 +80,37 @@ class MultiCamDataLoader:
         else:
             print(f"Warning: No global_path.csv found for scenario {self.current_scenario}")
             self.global_path = None
+
+    def _load_hd_map(self, scenario_path):
+        """Load pre-generated HD Map images."""
+        hd_map_images = []
+        
+        # 정확한 HD Map 경로 설정
+        hd_map_path = os.path.join(scenario_path, self.hd_map_dir)
+        
+        print(f"Attempting to load HD Map from: {hd_map_path}")
+        
+        if not os.path.exists(hd_map_path):
+            print(f"Warning: HD Map directory not found: {hd_map_path}")
+            return None
+
+        # HD Map 이미지 파일을 정렬하여 로드
+        hd_map_files = sorted([f for f in os.listdir(hd_map_path) if f.endswith(".png")])
+        if not hd_map_files:
+            print(f"Warning: No HD Map files found in directory: {hd_map_path}")
+            return None
+
+        for file_name in hd_map_files:
+            file_path = os.path.join(hd_map_path, file_name)
+            hd_map_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+            if hd_map_image is None:
+                print(f"Warning: Failed to load HD Map image: {file_path}")
+                continue
+            hd_map_image = cv2.resize(hd_map_image, self.map_size)
+            hd_map_images.append(hd_map_image)
+
+        print(f"Loaded {len(hd_map_images)} HD Map images from {hd_map_path}")
+        return np.array(hd_map_images)
 
     def _load_global_path(self, file_path):
         """Load Global Path from a CSV file."""
@@ -112,7 +151,7 @@ class MultiCamDataLoader:
 
         self.matched_frames = []
         for start_idx in range(0, min_length - self.time_steps + 1):
-            sequence_data = {"camera_data": [], "ego_data": []}
+            sequence_data = {"camera_data": [], "ego_data": [], "hd_map_data": []}
             for t in range(self.time_steps):
                 current_idx = start_idx + t
                 ego_frame = ego_frame_numbers[current_idx]
@@ -125,6 +164,23 @@ class MultiCamDataLoader:
                         camera_image = self._load_camera_image(camera_frame_path)
                         time_step_camera_data.append(camera_image)
                 sequence_data["camera_data"].append(np.stack(time_step_camera_data))
+
+                # Load HD Map data for the current timestep
+                if self.hd_map_data is not None:
+                    if current_idx < len(self.hd_map_data):
+                        hd_map_frame = self.hd_map_data[current_idx]
+                        hd_map_tensor = self._process_hd_map(hd_map_frame)
+                        sequence_data["hd_map_data"].append(hd_map_tensor)
+                    else:
+                        # HD Map 데이터가 부족한 경우 경고 출력
+                        print(f"Warning: Missing HD Map data for timestep {current_idx} in scenario {self.current_scenario}")
+                        empty_hd_map = np.zeros((6, *self.map_size), dtype=np.float32)
+                        sequence_data["hd_map_data"].append(empty_hd_map)
+                else:
+                    # HD Map 데이터가 없는 경우 경고 출력
+                    print(f"Warning: No HD Map data loaded for scenario {self.current_scenario}")
+                    empty_hd_map = np.zeros((6, *self.map_size), dtype=np.float32)
+                    sequence_data["hd_map_data"].append(empty_hd_map)
 
                 # Load corresponding EGO_INFO
                 ego_file = self.ego_frames[ego_frame]
@@ -168,6 +224,16 @@ class MultiCamDataLoader:
         }
         return {"input": input_data, "gt": gt_data}
 
+    def _process_hd_map(self, hd_map_frame):
+        """Process HD Map frame into a multi-channel tensor."""
+        exterior = (hd_map_frame[:, :, 0] > 200).astype(np.float32)  # 빨강 채널
+        interior = (hd_map_frame[:, :, 1] > 200).astype(np.float32)  # 초록 채널
+        lane = (hd_map_frame[:, :, 2] > 200).astype(np.float32)      # 파랑 채널
+        crosswalk = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 1] > 200)).astype(np.float32)  # 노랑
+        traffic_light = ((hd_map_frame[:, :, 1] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)  # 청록
+        ego_vehicle = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)  # 자주색
+
+        return np.stack([exterior, interior, lane, crosswalk, traffic_light, ego_vehicle], axis=0)
 
     def __iter__(self):
         """Yield batches of data."""
@@ -199,6 +265,13 @@ class MultiCamDataLoader:
                 device=self.device
             ).reshape(self.batch_size, self.time_steps, len(self.camera_dirs), 4, 4)
 
+            # (B, T, C, H, W) - HD Map
+            hd_map_tensors = torch.tensor(
+                [np.stack(item["hd_map_data"]) for item in batch],
+                dtype=torch.float32,
+                device=self.device
+            )
+
             # (B, T, input-dim)
             ego_inputs = []
             for item in batch:
@@ -222,7 +295,7 @@ class MultiCamDataLoader:
                 device=self.device
             )
 
-            yield camera_images, intrinsics, extrinsics, torch.tensor(ego_inputs, dtype=torch.float32, device=self.device), gt_data
+            yield camera_images, intrinsics, extrinsics, hd_map_tensors, torch.tensor(ego_inputs, dtype=torch.float32, device=self.device), gt_data
 
 
     def _is_float(self, value):
@@ -248,46 +321,3 @@ class MultiCamDataLoader:
     def _compute_relative_path(self, next_points, current_position):
         """Compute relative path points to the current position."""
         return (next_points - np.array(current_position)).flatten()
-
-# --- Batch 0 ---
-# Camera Images Shape:   (2, 4, 5, 3, 224, 224)
-# Intrinsics Shape:      (2, 4, 5, 3, 3)
-# Extrinsics Shape:      (2, 4, 5, 4, 4)
-# Ego Inputs Shape:      (2, 4, 19)
-# Ground Truth Shape:    (2, 4, 3)
-
-if __name__ == "__main__":
-    # 루트 디렉토리 및 카메라 설정
-    base_root = "/home/jaehyeon/Desktop/VIPLAB/HD_E2E"
-    map_name = "R_KR_PG_KATRI__HMG"
-    camera_dirs = ["CAMERA_1", "CAMERA_2", "CAMERA_3", "CAMERA_4", "CAMERA_5"]
-
-    # DataLoader 설정
-    loader = MultiCamDataLoader(
-        base_root=base_root,
-        map_name=map_name,
-        camera_dirs=camera_dirs,
-        batch_size=2,  # B=2
-        img_size=(224, 224),  # 이미지 크기
-        time_steps=4  # T=4
-    )
-
-    # 첫 번째 시나리오 로드
-    if not loader.scenario_paths:
-        print("No scenarios found!")
-    else:
-        scenario_path = loader.scenario_paths[0]
-        loader.set_scenario(scenario_path)
-        print(f"Loaded scenario: {scenario_path}")
-
-        # 데이터 로드 및 shape 확인
-        for batch_idx, (camera_images, intrinsics, extrinsics, ego_inputs, gt_data) in enumerate(loader):
-            print(f"--- Batch {batch_idx} ---")
-            print(f"Camera Images Shape:   {camera_images.shape}")  # (B, T, N, C, H, W)
-            print(f"Intrinsics Shape:      {intrinsics.shape}")     # (B, T, N, 3, 3)
-            print(f"Extrinsics Shape:      {extrinsics.shape}")     # (B, T, N, 4, 4)
-            print(f"Ego Inputs Shape:      {ego_inputs.shape}")     # (B, T, input-dim)
-            print(f"Ground Truth Shape:    {gt_data.shape}")       # (B, T, output-dim)
-
-            # 첫 배치만 출력
-            break
