@@ -484,7 +484,7 @@ class SequenceEncoder(nn.Module):
         return fused_bev
 
 if __name__ == "__main__":
-    # 예) B=2, T=4, N=3, C=3, H=224, W=480
+    # 예) B=1, T=2, N=3, C=3, H=224, W=480
     B, T, N, C, H, W = 1, 2, 3, 3, 224, 480
 
     # 시퀀스용 더미 입력
@@ -543,25 +543,14 @@ if __name__ == "__main__":
     )
 
     # ----------------------------------------------------------------
-    # 1) T=4 시퀀스 처리
+    # 1) T=2 시퀀스 처리
     # ----------------------------------------------------------------
     output_seq = sequence_encoder(batch_seq)
     print(f"\n[SequenceEncoder Output] shape: {tuple(output_seq.shape)}")
-    # 예) (2, 4, 128, 50, 50) 등
+    # (1, 2, 128, 50, 50)
 
-    # ----------------------------------------------------------------
-    # 2) T=1도 동일 구조로 처리 (단일 프레임 = T=1)
-    # ----------------------------------------------------------------
-    batch_single = {
-        "image": batch_seq["image"][:, :1],        # (B, 1, N, C, H, W)
-        "intrinsics": batch_seq["intrinsics"][:, :1],
-        "extrinsics": batch_seq["extrinsics"][:, :1],
-    }
-    output_single = sequence_encoder(batch_single)
-    print(f"[T=1 (Single Frame) Output] shape: {tuple(output_single.shape)}")
-    # 예) (2, 1, 128, 50, 50)
 
 
 # 로더 단계에서 T를 어떻게 정할건지 결정
-#  프레임을 한꺼번에 받아서 각 프레임별로 BEV를 만든 뒤 시간축으로 후처리할 뿐,
-#  “이전 프레임 + 현재 프레임”이라는 로직은 별도로 강제하지 않습니다.
+# 프레임을 한꺼번에 받아서 각 프레임별로 BEV를 만든 뒤 시간축으로 후처리할 뿐,
+# “이전 프레임 + 현재 프레임”이라는 로직은 별도로 강제 X
