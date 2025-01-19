@@ -6,7 +6,7 @@ from einops import rearrange, repeat
 from torchvision.models.resnet import Bottleneck
 from typing import List
 
-from utils.backbones.efficientnet import EfficientNetExtractor
+from models.backbones.efficientnet import EfficientNetExtractor
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
