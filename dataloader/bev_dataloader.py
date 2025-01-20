@@ -215,7 +215,14 @@ class MultiCamDataLoader:
             "trafficlightid": ego_data[10].split(":")[1].strip(),
             "turn_signal_lamp": float(ego_data[11].split(":")[1].strip()),
         }
+        # 다음 경로 점 추가
+        current_position = input_data["position"]
+        next_points = self._get_next_path_points(self.global_path, current_position, n_points=5)
+        relative_path = self._compute_relative_path(next_points, current_position)
 
+        # 경로 점을 input_data에 추가
+        input_data["relative_path"] = relative_path.tolist()
+        
         gt_data = {
             "accel": float(ego_data[6].split(":")[1].strip()),
             "brake": float(ego_data[7].split(":")[1].strip()),
