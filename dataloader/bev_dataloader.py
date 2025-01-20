@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+import re
 
 class MultiCamDataLoader:
     def __init__(self, base_root, map_name, camera_dirs, hd_map_dir, batch_size=32, img_size=(224, 480), time_steps=4, map_size=(256, 256)):
@@ -10,7 +11,7 @@ class MultiCamDataLoader:
         Args:
             base_root: 데이터셋 루트 경로
             map_name: 맵 이름
-            camera_dirs: 카메라 디렉토리 리스트 (["CAMERA_1", ..., "CAMERA_5"])
+            camera_dirs: 카메라 디렉토리 리스트 (예: ["CAMERA_1", ..., "CAMERA_5"])
             batch_size: 배치 크기
             img_size: 이미지 크기 (H, W)
             time_steps: 시퀀스 길이 (T)
@@ -57,6 +58,21 @@ class MultiCamDataLoader:
             if d.startswith(self.map_name) and os.path.isdir(os.path.join(self.base_root, d))
         )
 
+    def _load_global_path(self, file_path):
+        """Load Global Path from a CSV file."""
+        print(f"Attempting to load global_path from: {file_path}")
+        if not os.path.exists(file_path):
+            print(f"Error: File does not exist at {file_path}")
+            return None
+
+        try:
+            global_path = pd.read_csv(file_path)
+            print(f"Loaded Global Path Data: {global_path.head()}")  # 데이터 일부 출력
+            return global_path[['PositionX (m)', 'PositionY (m)']].to_numpy()
+        except Exception as e:
+            print(f"Error while loading global path: {e}")
+            return None
+
     def set_scenario(self, scenario_path):
         """Set the current scenario and prepare data."""
         print(f"Setting scenario: {scenario_path}")  # 디버깅 출력
@@ -69,17 +85,22 @@ class MultiCamDataLoader:
         self.ego_frames = {}
         self.matched_frames = []
         self._load_data()
-        self.match_data()
-        
-    
         # Load Global Path
         global_path_file = os.path.join(scenario_path, "global_path.csv")
+
         if os.path.exists(global_path_file):
+            print("Global path file exists. Attempting to load...")
             self.global_path = self._load_global_path(global_path_file)
+            if self.global_path is None:
+                print("Error: Failed to load global_path.csv.")
+            else:
+                print(f"Global Path Loaded: {self.global_path.shape}")
         else:
             print(f"Warning: No global_path.csv found for scenario {self.current_scenario}")
             self.global_path = None
 
+        self.match_data()
+        
     def _load_hd_map(self, scenario_path):
         """Load pre-generated HD Map images."""
         hd_map_images = []
@@ -93,12 +114,22 @@ class MultiCamDataLoader:
             print(f"Warning: HD Map directory not found: {hd_map_path}")
             return None
 
-        # HD Map 이미지 파일을 정렬하여 로드
-        hd_map_files = sorted([f for f in os.listdir(hd_map_path) if f.endswith(".png")])
+        # 파일 이름에서 숫자를 추출하여 정렬
+        def extract_number(file_name):
+            match = re.search(r'(\d+)', file_name)
+            return int(match.group(1)) if match else float('inf')
+
+        # HD Map 이미지 파일 정렬
+        hd_map_files = sorted(
+            [f for f in os.listdir(hd_map_path) if f.endswith(".png")],
+            key=extract_number
+        )
+        
         if not hd_map_files:
             print(f"Warning: No HD Map files found in directory: {hd_map_path}")
             return None
 
+        # HD Map 이미지를 로드 및 크기 조정
         for file_name in hd_map_files:
             file_path = os.path.join(hd_map_path, file_name)
             hd_map_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
@@ -110,11 +141,6 @@ class MultiCamDataLoader:
 
         print(f"Loaded {len(hd_map_images)} HD Map images from {hd_map_path}")
         return np.array(hd_map_images)
-
-    def _load_global_path(self, file_path):
-        """Load Global Path from a CSV file."""
-        global_path = pd.read_csv(file_path)
-        return global_path[['PositionX (m)', 'PositionY (m)']].to_numpy()
 
     def _load_data(self):
         """Load data from the specified directories."""
@@ -201,6 +227,20 @@ class MultiCamDataLoader:
         image = image / 255.0  # Normalize to [0, 1]
         return image.transpose(2, 0, 1)  # Convert to (C, H, W)
 
+    def _get_next_path_points(self, global_path, current_position, n_points=5):
+        """Get the next n path points relative to the current position."""
+        distances = np.linalg.norm(global_path - np.array(current_position), axis=1)
+        nearest_idx = np.argmin(distances)
+        next_points = global_path[nearest_idx:nearest_idx + n_points]
+        if len(next_points) < n_points:
+            padding = np.zeros((n_points - len(next_points), global_path.shape[1]))
+            next_points = np.vstack((next_points, padding))
+        return next_points
+
+    def _compute_relative_path(self, next_points, current_position):
+        """Compute relative path points to the current position."""
+        return (next_points - np.array(current_position)).flatten()
+
     def _parse_ego_info_data(self, ego_data):
         """Parse EGO_INFO data into input and GT."""
         input_data = {
@@ -215,14 +255,18 @@ class MultiCamDataLoader:
             "trafficlightid": ego_data[10].split(":")[1].strip(),
             "turn_signal_lamp": float(ego_data[11].split(":")[1].strip()),
         }
-        # 다음 경로 점 추가
-        current_position = input_data["position"]
-        next_points = self._get_next_path_points(self.global_path, current_position, n_points=5)
-        relative_path = self._compute_relative_path(next_points, current_position)
 
-        # 경로 점을 input_data에 추가
+        # 다음 경로 점 추가
+        current_position = input_data["position"][:2]  # [x, y]만 추출
+
+        if self.global_path is None:
+            print("Warning: global_path is None. Skipping relative path computation.")
+            relative_path = np.zeros((5, 2)).flatten()  # 기본값 설정
+        else:
+            next_points = self._get_next_path_points(self.global_path, current_position, n_points=5)
+            relative_path = self._compute_relative_path(next_points, current_position)
         input_data["relative_path"] = relative_path.tolist()
-        
+
         gt_data = {
             "accel": float(ego_data[6].split(":")[1].strip()),
             "brake": float(ego_data[7].split(":")[1].strip()),
@@ -318,16 +362,4 @@ class MultiCamDataLoader:
 
 
 
-    def _get_next_path_points(self, global_path, current_position, n_points=5):
-        """Get the next n path points relative to the current position."""
-        distances = np.linalg.norm(global_path - np.array(current_position), axis=1)
-        nearest_idx = np.argmin(distances)
-        next_points = global_path[nearest_idx:nearest_idx + n_points]
-        if len(next_points) < n_points:
-            padding = np.zeros((n_points - len(next_points), global_path.shape[1]))
-            next_points = np.vstack((next_points, padding))
-        return next_points
 
-    def _compute_relative_path(self, next_points, current_position):
-        """Compute relative path points to the current position."""
-        return (next_points - np.array(current_position)).flatten()
