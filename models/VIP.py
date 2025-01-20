@@ -94,7 +94,7 @@ class CombinedModel(nn.Module):
             bev_dim=128,
             hd_map_dim=6,
             front_view_dim=256,
-            ego_dim=19,
+            ego_dim=29,
             fused_dim=64,
             output_dim=32
         )
