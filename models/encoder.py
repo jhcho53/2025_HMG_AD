@@ -10,7 +10,6 @@ from models.backbones.efficientnet import EfficientNetExtractor
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
-
 def generate_grid(height: int, width: int):
     """
     height x width 크기의 정규화(normalized) grid 생성.
@@ -41,7 +40,6 @@ def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
         [ 0.,  0.,            1.]
     ]
 
-
 class Normalize(nn.Module):
     def __init__(self, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
         super().__init__()
@@ -50,7 +48,6 @@ class Normalize(nn.Module):
 
     def forward(self, x):
         return (x - self.mean) / self.std
-
 
 class RandomCos(nn.Module):
     def __init__(self, *args, stride=1, padding=0, **kwargs):
@@ -65,7 +62,6 @@ class RandomCos(nn.Module):
 
     def forward(self, x):
         return torch.cos(F.conv2d(x, self.weight, self.bias, **self.kwargs))
-
 
 class BEVEmbedding(nn.Module):
     """
@@ -121,7 +117,6 @@ class BEVEmbedding(nn.Module):
         (d, h, w) 형태의 학습된 BEV 임베딩을 반환
         """
         return self.learned_features
-
 
 
 class CrossAttention(nn.Module):
@@ -202,7 +197,6 @@ class CrossAttention(nn.Module):
         # (b, d, H, W)
         z = rearrange(z, 'b (H W) d -> b d H W', H=H, W=W)
         return z
-
 
 class CrossViewAttention(nn.Module):
     """
@@ -305,6 +299,8 @@ class CrossViewAttention(nn.Module):
             key_flat = img_embed + self.feature_proj(feature_flat)
         else:
             key_flat = img_embed
+        # print(f"feature_flat shape: {feature_flat.shape}")
+        # feature_flat shape: torch.Size([10, 32, 56, 120])
 
         val_flat = self.feature_linear(feature_flat)
 
@@ -314,8 +310,6 @@ class CrossViewAttention(nn.Module):
         val   = rearrange(val_flat, '(b n) d h w -> b n d h w', b=b, n=n)
 
         return self.cross_attend(query, key, val, skip=x if self.skip else None)
-
-
 
 class SingleFrameEncoder(nn.Module):
     """
@@ -403,11 +397,10 @@ class SingleFrameEncoder(nn.Module):
 
         return x
 
-
 class TemporalTransformer(nn.Module):
     """
     (B, T, D, H, W) -> (B, T, D, H, W)
-    시간축으로 Transformer Encoder를 적용하는 예시
+    시간축으로 Transformer Encoder를 적용
     """
     def __init__(self, d_model=128, nhead=8, num_layers=2):
         super().__init__()
@@ -422,7 +415,7 @@ class TemporalTransformer(nn.Module):
     def forward(self, x):
         """
         x: (B, T, D, H, W)
-        리턴: (B, T, D, H, W)
+        return: (B, T, D, H, W)
         """
         B, T, D, H, W = x.shape
         # (B, T, D, H, W) -> (T, B*H*W, D)
@@ -446,7 +439,7 @@ class SequenceEncoder(nn.Module):
     def __init__(self, base_encoder: nn.Module, temporal_module: nn.Module):
         super().__init__()
         self.base_encoder = base_encoder       # SingleFrameEncoder
-        self.temporal_module = temporal_module # 시간축 모듈(Transformer 등)
+        self.temporal_module = temporal_module # 시간축 모듈
 
     def forward(self, batch):
         """
@@ -482,75 +475,3 @@ class SequenceEncoder(nn.Module):
         # 4) 시간축 Transformer -> (B, T, D, H_bev, W_bev)
         fused_bev = self.temporal_module(bev_seq)
         return fused_bev
-
-if __name__ == "__main__":
-    # 예) B=1, T=2, N=3, C=3, H=224, W=480
-    B, T, N, C, H, W = 1, 2, 3, 3, 224, 480
-
-    # 시퀀스용 더미 입력
-    batch_seq = {
-        "image": torch.randn(B, T, N, C, H, W),
-        "intrinsics": torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, T, N, 1, 1),
-        "extrinsics": torch.eye(4).unsqueeze(0).unsqueeze(0).repeat(B, T, N, 1, 1),
-    }
-    print("[Sequence Input Shapes]")
-    for k, v in batch_seq.items():
-        print(f"  {k}: {tuple(v.shape)}")
-
-    # Initialize backbone
-    backbone = EfficientNetExtractor(
-        layer_names=['reduction_2', 'reduction_4'],
-        image_height=224,
-        image_width=480,
-        model_name='efficientnet-b4'
-    )
-
-    cross_view_config = {
-        "heads": 4,
-        "dim_head": 32,
-        "qkv_bias": True,
-        "skip": True,
-        "no_image_features": False,
-        "image_height": 224,
-        "image_width": 480,
-    }
-
-    bev_embedding_config = {
-        "sigma": 1.0,
-        "bev_height": 200,
-        "bev_width": 200,
-        "h_meters": 100.0,
-        "w_meters": 100.0,
-        "offset": 0.0,
-        "decoder_blocks": [2, 2],
-    }
-
-    # SingleFrameEncoder
-    single_frame_encoder = SingleFrameEncoder(
-        backbone=backbone,
-        cross_view=cross_view_config,
-        bev_embedding=bev_embedding_config,
-        dim=128
-    )
-
-    # Temporal Transformer
-    temporal_transformer = TemporalTransformer(d_model=128, nhead=8, num_layers=2)
-
-    # SequenceEncoder (통합 모델)
-    sequence_encoder = SequenceEncoder(
-        base_encoder=single_frame_encoder,
-        temporal_module=temporal_transformer
-    )
-
-    # ----------------------------------------------------------------
-    # 1) T=2 시퀀스 처리
-    # ----------------------------------------------------------------
-    output_seq = sequence_encoder(batch_seq)
-    print(f"\n[SequenceEncoder Output] shape: {tuple(output_seq.shape)}")
-    # (1, 2, 128, 50, 50)
-
-
-
-# 로더 단계에서 T를 어떻게 정할건지 결정
-# 프레임을 한꺼번에 받아서 각 프레임별로 BEV를 만든 뒤 시간축으로 후처리할 뿐,
-# “이전 프레임 + 현재 프레임”이라는 로직은 별도로 강제 X

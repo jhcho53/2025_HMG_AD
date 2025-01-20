@@ -10,7 +10,7 @@ class MultiCamDataLoader:
         Args:
             base_root: 데이터셋 루트 경로
             map_name: 맵 이름
-            camera_dirs: 카메라 디렉토리 리스트 (예: ["CAMERA_1", ..., "CAMERA_5"])
+            camera_dirs: 카메라 디렉토리 리스트 (["CAMERA_1", ..., "CAMERA_5"])
             batch_size: 배치 크기
             img_size: 이미지 크기 (H, W)
             time_steps: 시퀀스 길이 (T)
@@ -70,7 +70,6 @@ class MultiCamDataLoader:
         self.matched_frames = []
         self._load_data()
         self.match_data()
-        print("--------------")
         
     
         # Load Global Path
@@ -296,6 +295,10 @@ class MultiCamDataLoader:
             )
 
             yield camera_images, intrinsics, extrinsics, hd_map_tensors, torch.tensor(ego_inputs, dtype=torch.float32, device=self.device), gt_data
+
+    def __len__(self):
+        import math
+        return math.ceil(len(self.matched_frames) / self.batch_size)
 
 
     def _is_float(self, value):
