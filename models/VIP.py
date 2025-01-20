@@ -125,7 +125,7 @@ class CombinedModel(nn.Module):
             ego_inputs    :  (B, T, ego_dim)
 
         Returns:
-            output: (B, T, Control)  # 수정된 출력 형상
+            output: (B, T, Control)
         """
         # 전면 카메라 이미지 추출 (N_cam의 첫 번째 카메라를 전면 카메라로 가정)
         front_camera_images = camera_images[:, :, 0]  # (B, T, C, H, W)
