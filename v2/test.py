@@ -1,9 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from models.bev_encoder import Encoder
-from models.hd_encoder import HDMapFeaturePipeline
-from models.ego_encoder import FeatureEmbedding
-from models.front_encoder import TrafficLightEncoder
+from models.encoder import Encoder, HDMapFeaturePipeline, FeatureEmbedding, TrafficLightEncoder
 from models.GRU import BEVGRU, EgoStateGRU, FutureControlGRU
 from models.backbones.efficientnet import EfficientNetExtractor
 from utils.attention import CrossViewAttention, FeatureFusionAttention
@@ -16,8 +13,8 @@ def main():
     print(f"Using device: {device}")
 
     # 설정 직접 선언
-    image_h, image_w = 270, 480  # 이미지 크기
-    bev_h, bev_w = 256, 256  # BEV 크기
+    image_h, image_w = 135, 240  # 이미지 크기
+    bev_h, bev_w = 150, 150  # BEV 크기
     bev_h_meters, bev_w_meters = 50, 50
     bev_offset = 0
     decoder_blocks = [128, 128, 64]
@@ -63,10 +60,10 @@ def main():
     ).to(device)
 
     # BEV GRU 모델 초기화
-    input_dim = 256 * 32 * 32  # channel * height * width
+    input_dim = 256 * 18 * 18  # channel * height * width
     hidden_dim = 256  # GRU hidden state 크기
     output_dim = 128  # 최종 출력 채널 수
-    height, width = 32, 32
+    height, width = 18, 18
 
     bev_gru_model = BEVGRU(input_dim, hidden_dim, output_dim, height, width).to(device)
 
@@ -98,27 +95,28 @@ def main():
             "ego_info": data["ego_info"].to(device),
         }
 
-        # HD Map Encoding
-        hd_map_pipeline = HDMapFeaturePipeline(input_channels=6, final_channels=128, final_size=(32, 32)).to(device)
-        hd_features = hd_map_pipeline(batch["hd_map"])  # torch.Size([1, 4, 128, 32, 32])
+    # HD Map Encoding
+    hd_map_pipeline = HDMapFeaturePipeline(input_channels=6, final_channels=128, final_size=(18, 18)).to(device)
+    hd_features = hd_map_pipeline(batch["hd_map"])  # torch.Size([1, 4, 128, 18, 18])
 
-        # Ego Encoding
-        model = FeatureEmbedding(hidden_dim=32, output_dim=16).to(device)
-        embedding = model(batch["ego_info"])  # Embedding Shape: torch.Size([1, 4, 112])
-        ego_gru_output = ego_gru_model(embedding)  # torch.size([1, 2, 128])
+    # Ego Encoding
+    model = FeatureEmbedding(hidden_dim=32, output_dim=16).to(device)
+    embedding = model(batch["ego_info"])  # Embedding Shape: torch.Size([1, 4, 112])
+    ego_gru_output = ego_gru_model(embedding)  # torch.size([1, 2, 128])
 
-        # BEV Encoding
-        output = encoder(batch)  # torch.Size([1, 4, 128, 32, 32])
-        concat_bev = torch.cat([hd_features, output], dim=2)  # torch.size([1, 4, 256, 32, 32])
+    # BEV Encoding
+    output = encoder(batch)  # torch.Size([1, 4, 128, 18, 18])
+    concat_bev = torch.cat([hd_features, output], dim=2)  # torch.size([1, 4, 256, 18, 18])
 
-        gru_bev_train, gru_bev = bev_gru_model(concat_bev)  # torch.size([1, 4, 128, 32, 32]) // torch.size(1, 2, 128, 32, 32)
+    gru_bev_train, gru_bev = bev_gru_model(concat_bev)  # torch.size([1, 4, 128, 18, 18]) // torch.size(1, 2, 128, 18, 18)
 
-        # Front-view Encoding
-        front_feature = Traffic_encoder(batch["image"])  # torch.Size([1, 128])
-        fusion_output = fusion_model(front_feature, gru_bev, ego_gru_output)  # torch.Size([1, 2, 128])
+    # Front-view Encoding
+    front_feature = Traffic_encoder(batch["image"])  # torch.Size([1, 128])
+    fusion_output = fusion_model(front_feature, gru_bev, ego_gru_output)  # torch.Size([1, 2, 128])
 
-        # Control Output
-        control = future_control_gru(fusion_output)  # torch.size([1,3])
+    # Control Output
+    control = future_control_gru(fusion_output)  # torch.size([1,3])
 
+    print(control.shape)
 if __name__ == "__main__":
     main()

@@ -8,7 +8,7 @@ from torchvision import transforms
 import re
 
 class camDataLoader(Dataset):
-    def __init__(self, root_dir, num_timesteps=4, image_size=(270, 480), map_size=(256, 256), hd_map_dir="HD_MAP", ego_info_dir="EGO_INFO"):
+    def __init__(self, root_dir, num_timesteps=4, image_size=(135, 240), map_size=(200, 200), hd_map_dir="HD_MAP", ego_info_dir="EGO_INFO"):
         """
         Args:
             root_dir (str): Root directory containing CALIBRATION and scenario folders.
