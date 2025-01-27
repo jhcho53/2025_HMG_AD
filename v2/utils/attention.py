@@ -169,3 +169,73 @@ class CrossViewAttention(nn.Module):
             val = rearrange(val_flat, '(b n) ... -> b n ...', b=b_t, n=n)             # b n d h w
 
             return self.cross_attend(query, key, val, skip=x if self.skip else None)
+        
+        
+class FeatureFusionAttention(nn.Module):
+    def __init__(self, feature_dim, bev_dim, time_steps, spatial_dim, pooled_dim=16):
+        """
+        Args:
+            feature_dim (int): Dimension of the front-view and ego features (e.g., 128).
+            bev_dim (int): Dimension of the BEV feature channels (e.g., 128).
+            time_steps (int): Number of time steps in the BEV and ego features (e.g., 2).
+            spatial_dim (int): Height and width of the BEV spatial feature map (e.g., 32).
+            pooled_dim (int): Dimension to which the BEV feature spatial size is pooled.
+        """
+        super(FeatureFusionAttention, self).__init__()
+        
+        self.feature_dim = feature_dim
+        self.bev_dim = bev_dim
+        self.time_steps = time_steps
+        self.spatial_dim = spatial_dim
+        self.pooled_dim = pooled_dim
+
+        # Adaptive Average Pooling to reduce BEV feature spatial dimensions
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((pooled_dim, pooled_dim))
+
+        # Attention mechanism for front-view feature and ego feature
+        self.front_ego_attention = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=4, batch_first=True)
+        
+        # Attention mechanism for BEV features
+        self.bev_attention = nn.MultiheadAttention(embed_dim=bev_dim * pooled_dim * pooled_dim, num_heads=4, batch_first=True)
+
+        # Fully connected layer to project attention output
+        self.fc = nn.Linear(feature_dim + bev_dim, feature_dim)
+
+    def forward(self, front_feature, bev_feature, ego_feature):
+        """
+        Args:
+            front_feature (torch.Tensor): Front-view feature [batch, feature_dim].
+            bev_feature (torch.Tensor): BEV features [batch, time, bev_dim, height, width].
+            ego_feature (torch.Tensor): Ego features [batch, time, feature_dim].
+        
+        Returns:
+            torch.Tensor: Fused feature with time dimension [batch, time, feature_dim].
+        """
+        batch_size, time_steps, bev_dim, height, width = bev_feature.size()
+
+        # Apply Adaptive Average Pooling to BEV features
+        bev_feature = self.adaptive_pool(bev_feature.view(-1, bev_dim, height, width))  # [batch * time, bev_dim, pooled_dim, pooled_dim]
+        bev_feature = bev_feature.view(batch_size, time_steps, bev_dim, self.pooled_dim, self.pooled_dim)  # [batch, time, bev_dim, pooled_dim, pooled_dim]
+
+        # Reshape BEV features for attention
+        bev_feature = bev_feature.view(batch_size, time_steps, -1)  # [batch, time, bev_dim * pooled_dim * pooled_dim]
+
+        # Apply attention between BEV features
+        bev_out, _ = self.bev_attention(bev_feature, bev_feature, bev_feature)  # [batch, time, bev_dim * pooled_dim * pooled_dim]
+
+        # Reshape back to separate dimensions for concatenation
+        bev_out = bev_out.view(batch_size, time_steps, bev_dim, self.pooled_dim, self.pooled_dim)  # [batch, time, bev_dim, pooled_dim, pooled_dim]
+
+        # Reshape front-view feature for concatenation
+        front_feature = front_feature.unsqueeze(1).expand(-1, time_steps, -1)  # [batch, time, feature_dim]
+
+        # Apply attention between front-view and ego features
+        fused_ego, _ = self.front_ego_attention(ego_feature, front_feature, front_feature)  # [batch, time, feature_dim]
+
+        # Concatenate BEV and fused ego features
+        fused_feature = torch.cat([fused_ego, bev_out.mean(dim=[3, 4])], dim=-1)  # [batch, time, feature_dim + bev_dim]
+
+        # Final projection
+        output = self.fc(fused_feature)  # [batch, time, feature_dim]
+
+        return output
