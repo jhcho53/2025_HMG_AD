@@ -8,7 +8,7 @@ from torchvision import transforms
 import re
 
 class camDataLoader(Dataset):
-    def __init__(self, root_dir, num_timesteps=3, image_size=(135, 240), map_size=(200, 200), 
+    def __init__(self, root_dir, num_timesteps=3, image_size=(135, 240), map_size=(144, 144), 
                  hd_map_dir="HD_MAP", ego_info_dir="EGO_INFO", traffic_info_dir="TRAFFIC_INFO"):
         """
         Args:
@@ -23,7 +23,7 @@ class camDataLoader(Dataset):
         self.root_dir = root_dir
         self.num_timesteps = num_timesteps          # 입력 프레임 개수
         self.future_steps = 2                       # 미래 GT 프레임 개수 (고정)
-        self.total_steps = self.num_timesteps + self.future_steps  # 총 사용 프레임 수
+        self.total_steps = self.num_timesteps + self.future_steps  # 총 사용 프레임 수 (예: 5)
         self.map_size = map_size
         self.hd_map_dir = hd_map_dir
         self.ego_info_dir = ego_info_dir
@@ -199,29 +199,52 @@ class camDataLoader(Dataset):
         # EGO_INFO 텐서 생성 및 입력/미래 분리
         ego_info_tensor = torch.tensor(ego_info_data, dtype=torch.float32)  # (total_steps, feature_dim)
         ego_info_input = ego_info_tensor[:self.num_timesteps]      # (num_timesteps, feature_dim)
-        ego_info_future = ego_info_tensor[self.num_timesteps:]       # (2, feature_dim)
+        ego_info_future = ego_info_tensor[self.num_timesteps:]       # (future_steps, feature_dim)
 
-        # 이미지 스택: (total_steps, num_cameras, C, H, W)
-        temporal_images = torch.stack(temporal_images, dim=1)
-        # Calibration 행렬은 total_steps 만큼 반복
+        # --- 이미지 데이터 (CAMERA) ---
+        # temporal_images: 리스트 길이 total_steps, 각 원소 (num_cameras, C, H, W)
+        # 스택 후 (total_steps, num_cameras, C, H, W)로 변환
+        temporal_images = torch.stack(temporal_images, dim=1)  # (num_cameras, total_steps, C, H, W)
+        temporal_images = temporal_images.permute(1, 0, 2, 3, 4)  # (total_steps, num_cameras, C, H, W)
+        images_input = temporal_images[:self.num_timesteps]       # (num_timesteps, num_cameras, C, H, W)
+        images_future = temporal_images[self.num_timesteps:]        # (future_steps, num_cameras, C, H, W)
+
+        # --- Calibration (intrinsic & extrinsic) ---
         intrinsic = torch.stack(self.intrinsic_data, dim=0).unsqueeze(1).repeat(1, self.total_steps, 1, 1)
         extrinsic = torch.stack(self.extrinsic_data, dim=0).unsqueeze(1).repeat(1, self.total_steps, 1, 1)
 
-        # HD Map 데이터 로드 및 전처리
+        intrinsic = intrinsic.permute(1, 0, 2, 3)  # (total_steps, num_cameras, 3, 3)
+        extrinsic = extrinsic.permute(1, 0, 2, 3)  # (total_steps, num_cameras, 4, 4)
+
+        intrinsic_input = intrinsic[:self.num_timesteps]
+        intrinsic_future = intrinsic[self.num_timesteps:]
+        extrinsic_input = extrinsic[:self.num_timesteps]
+        extrinsic_future = extrinsic[self.num_timesteps:]
+
+        # --- HD Map 데이터 로드 및 전처리 ---
         hd_map_images = self._load_hd_map(scenario_dir, camera_indices)
+        hd_map_input = None
+        hd_map_future = None
         if hd_map_images is not None:
+            # 각 프레임별 HD Map 전처리 (다중 채널)
             hd_map_images = np.stack([self._process_hd_map(frame) for frame in hd_map_images])
-            hd_map_images = torch.tensor(hd_map_images, dtype=torch.float32)
+            hd_map_images = torch.tensor(hd_map_images, dtype=torch.float32)  # (total_steps, channels, H, W)
+            hd_map_input = hd_map_images[:self.num_timesteps]
+            hd_map_future = hd_map_images[self.num_timesteps:]
 
         return {
-            "images": temporal_images.permute(1, 0, 2, 3, 4),  # (total_steps, num_cameras, C, H, W)
-            "intrinsic": intrinsic.permute(1, 0, 2, 3),          # (total_steps, num_cameras, 3, 3)
-            "extrinsic": extrinsic.permute(1, 0, 2, 3),          # (total_steps, num_cameras, 4, 4)
-            "scenario": scenario_dir,
-            "hd_map": hd_map_images if hd_map_images is not None else None,  # (total_steps, channels, H, W)
-            "ego_info": ego_info_input,       # (num_timesteps, feature_dim)
-            "ego_info_future": ego_info_future,  # (2, feature_dim)
-            "traffic": current_traffic_class   # 단일 값 (현재 프레임의 traffic classification)
+            "images_input": images_input,         # (num_timesteps, num_cameras, C, H, W)
+            "images_future": images_future,         # (future_steps, num_cameras, C, H, W)
+            "intrinsic_input": intrinsic_input,     # (num_timesteps, num_cameras, 3, 3)
+            "intrinsic_future": intrinsic_future,   # (future_steps, num_cameras, 3, 3)
+            "extrinsic_input": extrinsic_input,     # (num_timesteps, num_cameras, 4, 4)
+            "extrinsic_future": extrinsic_future,   # (future_steps, num_cameras, 4, 4)
+            "hd_map_input": hd_map_input,           # (num_timesteps, channels, H, W) 또는 None
+            "hd_map_future": hd_map_future,         # (future_steps, channels, H, W) 또는 None
+            "ego_info": ego_info_input,             # (num_timesteps, feature_dim)
+            "ego_info_future": ego_info_future,     # (future_steps, feature_dim)
+            "traffic": current_traffic_class,       # 단일 값 (현재 프레임의 traffic classification)
+            "scenario": scenario_dir
         }
 
     def _process_hd_map(self, hd_map_frame):

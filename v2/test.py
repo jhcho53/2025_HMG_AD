@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from models.encoder import Encoder, HDMapFeaturePipeline, FeatureEmbedding, TrafficLightEncoder
-from models.decoder import TrafficSignClassificationHead, EgoStateHead
+from models.decoder import TrafficSignClassificationHead, EgoStateHead, Decoder
 from models.GRU import BEVGRU, EgoStateGRU 
 from models.backbones.efficientnet import EfficientNetExtractor
 from models.control import FutureControlMLP
@@ -102,6 +102,9 @@ class EndToEndModel(nn.Module):
         
         # Future Ego Head 초기화
         self.ego_header = EgoStateHead(input_dim=128, hidden_dim=64, output_dim=21)
+        
+        # BEV decoder 초기화
+        self.bev_decoder = Decoder(dim=128, blocks=decoder_blocks, residual=True, factor=2)
     
     def forward(self, batch):
         """
@@ -129,6 +132,11 @@ class EndToEndModel(nn.Module):
         # BEV Encoding
         bev_output = self.encoder(batch)  
         # bev_output shape: [B, time_steps, 128, 18, 18]
+        
+        # BEV Decoding
+        bev_decoding = self.bev_decoder(bev_output)
+        # bev_decoding shape: [B, time_steps, 64, 144, 144]
+        
         # HD map feature와 BEV feature를 채널 차원에서 concat (256 채널)
         concat_bev = torch.cat([hd_features, bev_output], dim=2)  
         # concat_bev shape: [B, time_steps, 256, 18, 18]
@@ -157,6 +165,7 @@ class EndToEndModel(nn.Module):
             "classification": classification_output,
             "fusion": fusion_output,
             "future_ego": future_ego,
+            "bev_seg": bev_decoding
         }
 
 
@@ -199,16 +208,14 @@ def main():
         for batch_idx, data in enumerate(dataloader):
             # 데이터의 각 항목을 device로 이동
             batch = {
-                "image": data["images"].to(device),         # [B, num_views, C, H, W]
-                "intrinsics": data["intrinsic"].to(device),   # [B, num_views, 3, 3]
-                "extrinsics": data["extrinsic"].to(device),   # [B, num_views, 4, 4]
-                "hd_map": data["hd_map"].to(device),
+                "image": data["images_input"].to(device),         # [B, num_views, C, H, W]
+                "intrinsics": data["intrinsic_input"].to(device),   # [B, num_views, 3, 3]
+                "extrinsics": data["extrinsic_input"].to(device),   # [B, num_views, 4, 4]
+                "hd_map": data["hd_map_input"].to(device),
                 "ego_info": data["ego_info"].to(device),
             }
-            
             ego_info_future_gt = data["ego_info_future"].to(device)
-            traffic = data["traffic"].to(device)
-            print(traffic.shape)
+            traffic = data["traffic"].to(device) # [class]
             outputs = model(batch)
             control = outputs["control"]  # [B, 3]
             classification = outputs["classification"]  # [B, num_classes]
