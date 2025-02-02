@@ -2,55 +2,62 @@ import torch
 import torch.nn as nn
 
 class BEVGRU(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, height, width):
+    def __init__(self, input_channels, hidden_dim, output_dim, height, width):
         super(BEVGRU, self).__init__()
         self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         self.height = height
         self.width = width
 
+        # CNN을 사용하여 feature dimension을 hidden_dim으로 변환
+        self.feature_extractor = nn.Sequential(
+        nn.Conv2d(input_channels, hidden_dim // 2, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(),
+        nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(),
+        nn.AdaptiveAvgPool2d((1, 1)),  # [batch*seq_len, hidden_dim, 1, 1]
+        nn.Flatten()  # [batch*seq_len, hidden_dim]
+    )
+
         # GRU Layer
-        self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
-        
-        # Fully Connected Layer to project GRU output for each time step
+        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+
+        # Fully Connected Layer to project GRU output
         self.fc = nn.Linear(hidden_dim, output_dim * height * width)
 
-    def forward(self, x, current_index=2, future_index=3):
-        """
-        Forward pass to process all time steps and extract current & future concatenated features.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape [batch, seq_len, channel, height, width].
-            current_index (int): Index of the current time step.
-            future_index (int): Index of the future time step.
-        
-        Returns:
-            output (torch.Tensor): Processed features for all time steps [batch, seq_len, output_dim, height, width].
-            combined_bev (torch.Tensor): Concatenated BEV features for current and future time steps 
-                [batch, 2 * output_dim, height, width].
-        """
-        # Input dimensions
+    def forward(self, x, current_index=2, future_steps=2):
         batch_size, seq_len, channel, height, width = x.size()
+        
+        # CNN을 통해 feature dimension 줄이기
+        x = x.view(batch_size * seq_len, channel, height, width)  # [batch*seq_len, channel, height, width]
+        x = self.feature_extractor(x)  # [batch*seq_len, hidden_dim]
+        x = x.view(batch_size, seq_len, self.hidden_dim)  # [batch, seq_len, hidden_dim]
 
-        # Flatten spatial dimensions into a single feature dimension
-        x = x.view(batch_size, seq_len, -1)  # [batch, seq_len, channel * height * width]
-
-        # Pass through GRU
+        # GRU 처리
         gru_out, _ = self.gru(x)  # [batch, seq_len, hidden_dim]
 
-        # Project GRU output to spatial dimensions for all time steps
+        # 미래 예측 (Future Prediction)
+        last_hidden = gru_out[:, -1, :].unsqueeze(1)  # [batch, 1, hidden_dim]
+        future_pred = []
+
+        for _ in range(future_steps):
+            last_hidden, _ = self.gru(last_hidden)  # [batch, 1, hidden_dim]
+            future_pred.append(self.fc(last_hidden).view(batch_size, 1, -1, self.height, self.width))
+
+        future_pred = torch.cat(future_pred, dim=1)  # [batch, future_steps, output_dim, height, width]
+
+        # Project GRU output to spatial dimensions
         output = self.fc(gru_out)  # [batch, seq_len, output_dim * height * width]
+        output = output.view(batch_size, seq_len, self.output_dim, self.height, self.width)  # [batch, seq_len, output_dim, height, width]
 
-        # Reshape to [batch, seq_len, output_dim, height, width]
-        output = output.view(batch_size, seq_len, -1, self.height, self.width)
+        # Concatenate past, present, and future
+        total_output = torch.cat([output, future_pred], dim=1)  # [batch, seq_len + future_steps, output_dim, height, width]
 
-        # Extract current and future BEV features
-        current_bev = output[:, current_index].unsqueeze(1)  # [batch, 1, output_dim, height, width]
-        future_bev = output[:, future_index].unsqueeze(1)    # [batch, 1, output_dim, height, width]
+        # Extract current & future BEV
+        current_bev = total_output[:, current_index].unsqueeze(1)  # [batch, 1, output_dim, height, width]
+        future_bev = total_output[:, current_index + 1 : current_index + 1 + future_steps]  # [batch, 2, output_dim, height, width]
 
-        # Concatenate current and future features along the channel dimension
-        combined_bev = torch.cat([current_bev, future_bev], dim=1)  # [batch, 2, output_dim, height, width]
-
-        return output, combined_bev
+        return total_output, future_bev
     
 class EgoStateGRU(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1):
@@ -62,27 +69,54 @@ class EgoStateGRU(nn.Module):
             num_layers (int): Number of GRU layers.
         """
         super(EgoStateGRU, self).__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)  # Project to desired output dimension
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
 
-    def forward(self, x):
+        # GRU Layer
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+
+        # Fully Connected Layer to project to desired output dimension
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+        # Future Prediction을 위한 Linear Layer 추가
+        self.future_fc = nn.Linear(output_dim, input_dim)
+
+    def forward(self, x, future_steps=2):
         """
         Args:
-            x (torch.Tensor): Input tensor of shape [batch_size, seq_len, input_dim].
+            x (torch.Tensor): Input tensor of shape [batch_size, seq_len=3, input_dim].
+            future_steps (int): Number of future steps to predict (default: 2).
         
         Returns:
-            torch.Tensor: Output tensor of shape [batch_size, 2, output_dim], containing the outputs for the last two time steps.
+            torch.Tensor: Output tensor of shape [batch_size, future_steps, output_dim].
         """
-        # GRU forward pass
-        gru_out, _ = self.gru(x)  # [batch_size, seq_len, hidden_dim]
+        batch_size, seq_len, _ = x.size()
 
-        # Select the last two time steps
-        last_two_outputs = gru_out[:, -2:, :]  # [batch_size, 2, hidden_dim]
+        # GRU forward pass (과거 2개 + 현재)
+        gru_out, hidden_state = self.gru(x)  # [batch_size, seq_len, hidden_dim]
 
-        # Apply the fully connected layer to project to output_dim
-        output = self.fc(last_two_outputs)  # [batch_size, 2, output_dim]
+        # Initialize future predictions
+        future_pred = []
 
-        return output
+        # 🔹 Future step input을 마지막 실제 입력의 변형값으로 설정
+        future_input = self.future_fc(self.fc(gru_out[:, -1, :])).unsqueeze(1)  # [batch_size, 1, input_dim]
+
+        for _ in range(future_steps):
+            # 🔹 GRU로 future step 예측
+            next_out, hidden_state = self.gru(future_input, hidden_state)
+            next_output = self.fc(next_out.squeeze(1))  # [batch_size, output_dim]
+
+            # 🔹 Append prediction
+            future_pred.append(next_output.unsqueeze(1))  # [batch_size, 1, output_dim]
+
+            # 🔹 다음 step의 input을 업데이트 (이전 예측값을 다시 입력으로 사용)
+            future_input = self.future_fc(next_output).unsqueeze(1)  # [batch_size, 1, input_dim]
+
+        # 🔹 Concatenate future predictions
+        future_pred = torch.cat(future_pred, dim=1)  # [batch_size, future_steps, output_dim]
+
+        return future_pred
     
 class FutureControlGRU(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):

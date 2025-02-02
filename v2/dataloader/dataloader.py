@@ -223,9 +223,9 @@ class camDataLoader(Dataset):
 
 
 '''
-Image Shape: torch.Size([1, 4, 5, 3, 270, 480])
-Intrinsics Shape: torch.Size([1, 4, 5, 3, 3])
-Extrinsics Shape: torch.Size([1, 4, 5, 4, 4])
-HD Map Shape: torch.Size([1, 4, 6, 256, 256])
-Ego_info Shape: torch.Size([1, 4, 21])
+Image Shape: torch.Size([batch, time_step, 5, 3, 270, 480])
+Intrinsics Shape: torch.Size([batch, time_step, 5, 3, 3])
+Extrinsics Shape: torch.Size([batch, time_step, 5, 4, 4])
+HD Map Shape: torch.Size([batch, time_step, 6, 256, 256])
+Ego_info Shape: torch.Size([batch, time_step, 21])
 '''

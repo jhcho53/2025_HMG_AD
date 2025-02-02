@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 from models.encoder import Encoder, HDMapFeaturePipeline, FeatureEmbedding, TrafficLightEncoder
+from models.decoder import TrafficSignClassificationHead
 from models.GRU import BEVGRU, EgoStateGRU, FutureControlGRU
 from models.backbones.efficientnet import EfficientNetExtractor
 from utils.attention import CrossViewAttention, FeatureFusionAttention
@@ -60,7 +61,7 @@ def main():
     ).to(device)
 
     # BEV GRU 모델 초기화
-    input_dim = 256 * 18 * 18  # channel * height * width
+    input_dim = 256  # channel * height * width
     hidden_dim = 256  # GRU hidden state 크기
     output_dim = 128  # 최종 출력 채널 수
     height, width = 18, 18
@@ -80,7 +81,7 @@ def main():
     future_control_gru = FutureControlGRU(input_dim=128, hidden_dim=64, output_dim=3).to(device)
     
     root_dir = "/home/vip1/hd/2025_HMG_AD/v2/Dataset_sample"  # Replace with the actual root directory path
-    num_timesteps = 4
+    num_timesteps = 3
     calibration_dataset = camDataLoader(root_dir, num_timesteps=num_timesteps)
     calibration_dataloader = DataLoader(calibration_dataset, batch_size=1, shuffle=False)
 
@@ -97,26 +98,27 @@ def main():
 
     # HD Map Encoding
     hd_map_pipeline = HDMapFeaturePipeline(input_channels=6, final_channels=128, final_size=(18, 18)).to(device)
-    hd_features = hd_map_pipeline(batch["hd_map"])  # torch.Size([1, 4, 128, 18, 18])
+    hd_features = hd_map_pipeline(batch["hd_map"])  # torch.Size([batch, time_step, 128, 18, 18])
 
     # Ego Encoding
     model = FeatureEmbedding(hidden_dim=32, output_dim=16).to(device)
-    embedding = model(batch["ego_info"])  # Embedding Shape: torch.Size([1, 4, 112])
-    ego_gru_output = ego_gru_model(embedding)  # torch.size([1, 2, 128])
+    embedding = model(batch["ego_info"])  # Embedding Shape: torch.Size([1, 3, 112])
+    ego_gru_output = ego_gru_model(embedding)  # torch.size([1, 2(미래2), 128])
 
     # BEV Encoding
-    output = encoder(batch)  # torch.Size([1, 4, 128, 18, 18])
-    concat_bev = torch.cat([hd_features, output], dim=2)  # torch.size([1, 4, 256, 18, 18])
-
-    gru_bev_train, gru_bev = bev_gru_model(concat_bev)  # torch.size([1, 4, 128, 18, 18]) // torch.size(1, 2, 128, 18, 18)
+    output = encoder(batch)  # torch.Size([1, 3, 128, 18, 18])
+    concat_bev = torch.cat([hd_features, output], dim=2)  # torch.size([1, 3, 256, 18, 18])
+    gru_bev_train, gru_bev = bev_gru_model(concat_bev)  # torch.size([1, 5(과거2, 현재1, 미래2), 128, 18, 18]) // torch.size(1, 2(미래), 128, 18, 18)
 
     # Front-view Encoding
     front_feature = Traffic_encoder(batch["image"])  # torch.Size([1, 128])
-    fusion_output = fusion_model(front_feature, gru_bev, ego_gru_output)  # torch.Size([1, 2, 128])
+    fusion_output = fusion_model(front_feature, gru_bev, ego_gru_output)  # torch.Size([1, 2, 128]), 미래2
+
+    classification_head = TrafficSignClassificationHead(input_dim=128, num_classes=10).to(device)
+    front_decode = classification_head(front_feature) #torch.Size([1, num_classes])
 
     # Control Output
     control = future_control_gru(fusion_output)  # torch.size([1,3])
 
-    print(control.shape)
 if __name__ == "__main__":
     main()
