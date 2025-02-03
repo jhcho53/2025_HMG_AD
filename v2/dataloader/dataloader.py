@@ -9,7 +9,8 @@ import re
 
 class camDataLoader(Dataset):
     def __init__(self, root_dir, num_timesteps=3, image_size=(135, 240), map_size=(144, 144), 
-                 hd_map_dir="HD_MAP", ego_info_dir="EGO_INFO", traffic_info_dir="TRAFFIC_INFO"):
+                 hd_map_dir="HD_MAP", gt_hd_map_dir="GT_HD_MAP", ego_info_dir="EGO_INFO", 
+                 traffic_info_dir="TRAFFIC_INFO", num_traffic_classes=10):
         """
         Args:
             root_dir (str): CALIBRATION 및 시나리오 폴더들이 있는 루트 디렉토리.
@@ -17,8 +18,10 @@ class camDataLoader(Dataset):
             image_size (tuple): 출력 이미지 크기 (height, width).
             map_size (tuple): HD Map 이미지 크기 (height, width).
             hd_map_dir (str): 각 시나리오 내 HD_MAP 폴더 이름.
+            gt_hd_map_dir (str): 각 시나리오 내 GT_HD_MAP 폴더 이름 (BEV segmentation GT용).
             ego_info_dir (str): 각 시나리오 내 EGO_INFO 폴더 이름.
             traffic_info_dir (str): 각 시나리오 내 TRAFFIC_INFO 폴더 이름.
+            num_traffic_classes (int): traffic GT의 클래스 수 (one-hot 인코딩에 사용).
         """
         self.root_dir = root_dir
         self.num_timesteps = num_timesteps          # 입력 프레임 개수
@@ -26,8 +29,10 @@ class camDataLoader(Dataset):
         self.total_steps = self.num_timesteps + self.future_steps  # 총 사용 프레임 수 (예: 5)
         self.map_size = map_size
         self.hd_map_dir = hd_map_dir
+        self.gt_hd_map_dir = gt_hd_map_dir           # GT_HD_MAP 폴더 이름 (BEV segmentation GT)
         self.ego_info_dir = ego_info_dir
         self.traffic_info_dir = traffic_info_dir      # TRAFFIC_INFO 폴더 이름
+        self.num_traffic_classes = num_traffic_classes  # traffic GT 클래스 개수
 
         self.image_transform = transforms.Compose([
             transforms.Resize(image_size),   # 이미지 크기 고정
@@ -128,6 +133,7 @@ class camDataLoader(Dataset):
 
         temporal_images = []
         ego_info_data = []
+        control_info_data = []
         traffic_class_seq = []   # 입력 시퀀스 내 프레임에 해당하는 traffic classification 값을 저장
         camera_indices = []
 
@@ -168,7 +174,11 @@ class camDataLoader(Dataset):
                 default_length = 3
                 ego_info_values.extend(ego_info_dict.get(k, [0.0] * default_length))
             ego_info_data.append(ego_info_values)
-
+            
+            # control 부분만 따로 저장
+            control_data = ego_info_dict.get("control", [0.0] * 3)
+            control_info_data.append(control_data)
+            
             # --- TRAFFIC_INFO 파일 로드 및 traffic classification 결정 ---
             # 입력 시퀀스(frames 0 ~ num_timesteps-1)에 대해서만 처리
             if t < self.num_timesteps:
@@ -195,12 +205,18 @@ class camDataLoader(Dataset):
 
         # 최종 traffic classification 값은 입력 시퀀스의 마지막 프레임(현재 프레임)의 값 사용
         current_traffic_class = traffic_class_seq[-1] if traffic_class_seq else 0
+        # one-hot 인코딩: traffic GT를 (클래스 수,) 형태의 벡터로 변환
+        traffic_gt = torch.zeros(self.num_traffic_classes, dtype=torch.float32)
+        if current_traffic_class < self.num_traffic_classes:
+            traffic_gt[current_traffic_class] = 1.0
 
         # EGO_INFO 텐서 생성 및 입력/미래 분리
         ego_info_tensor = torch.tensor(ego_info_data, dtype=torch.float32)  # (total_steps, feature_dim)
         ego_info_input = ego_info_tensor[:self.num_timesteps]      # (num_timesteps, feature_dim)
         ego_info_future = ego_info_tensor[self.num_timesteps:]       # (future_steps, feature_dim)
-
+        control_info_tensor = torch.tensor(control_info_data, dtype=torch.float32)
+        control_info_future = control_info_tensor[self.num_timesteps+1:]
+        
         # --- 이미지 데이터 (CAMERA) ---
         # temporal_images: 리스트 길이 total_steps, 각 원소 (num_cameras, C, H, W)
         # 스택 후 (total_steps, num_cameras, C, H, W)로 변환
@@ -226,11 +242,20 @@ class camDataLoader(Dataset):
         hd_map_input = None
         hd_map_future = None
         if hd_map_images is not None:
-            # 각 프레임별 HD Map 전처리 (다중 채널)
             hd_map_images = np.stack([self._process_hd_map(frame) for frame in hd_map_images])
             hd_map_images = torch.tensor(hd_map_images, dtype=torch.float32)  # (total_steps, channels, H, W)
             hd_map_input = hd_map_images[:self.num_timesteps]
             hd_map_future = hd_map_images[self.num_timesteps:]
+
+        # --- GT HD Map 데이터 로드 및 전처리 (BEV segmentation GT) ---
+        gt_hd_map_images = self._load_gt_hd_map(scenario_dir, camera_indices)
+        gt_hd_map_input = None
+        gt_hd_map_future = None
+        if gt_hd_map_images is not None:
+            gt_hd_map_images = np.stack([self._process_gt_hd_map(frame) for frame in gt_hd_map_images])
+            gt_hd_map_images = torch.tensor(gt_hd_map_images, dtype=torch.float32)  # (total_steps, channels, H, W)
+            gt_hd_map_input = gt_hd_map_images[:self.num_timesteps]
+            gt_hd_map_future = gt_hd_map_images[self.num_timesteps:]
 
         return {
             "images_input": images_input,         # (num_timesteps, num_cameras, C, H, W)
@@ -241,10 +266,13 @@ class camDataLoader(Dataset):
             "extrinsic_future": extrinsic_future,   # (future_steps, num_cameras, 4, 4)
             "hd_map_input": hd_map_input,           # (num_timesteps, channels, H, W) 또는 None
             "hd_map_future": hd_map_future,         # (future_steps, channels, H, W) 또는 None
+            "gt_hd_map_input": gt_hd_map_input,       # (num_timesteps, channels, H, W) 또는 None (BEV segmentation GT)
+            "gt_hd_map_future": gt_hd_map_future,     # (future_steps, channels, H, W) 또는 None (BEV segmentation GT)
             "ego_info": ego_info_input,             # (num_timesteps, feature_dim)
             "ego_info_future": ego_info_future,     # (future_steps, feature_dim)
-            "traffic": current_traffic_class,       # 단일 값 (현재 프레임의 traffic classification)
-            "scenario": scenario_dir
+            "traffic": traffic_gt,                  # (num_traffic_classes,) -> DataLoader에서 (배치, num_traffic_classes)로 조합됨.
+            "scenario": scenario_dir,
+            "control": control_info_future
         }
 
     def _process_hd_map(self, hd_map_frame):
@@ -291,3 +319,52 @@ class camDataLoader(Dataset):
                 hd_map_images.append(hd_map_image)
 
         return np.array(hd_map_images)
+
+    def _load_gt_hd_map(self, scenario_path, camera_indices):
+        """GT_HD_MAP 폴더에서 BEV segmentation GT용 HD Map 이미지를 불러오고, 카메라 인덱스와 동기화."""
+        gt_hd_map_path = os.path.join(scenario_path, self.gt_hd_map_dir)
+
+        if not os.path.exists(gt_hd_map_path):
+            print(f"Warning: GT HD Map directory not found: {gt_hd_map_path}")
+            return None
+
+        def extract_number(file_name):
+            match = re.search(r'(\d+)', file_name)
+            return int(match.group(1)) if match else float('inf')
+
+        gt_hd_map_files = sorted(
+            [f for f in os.listdir(gt_hd_map_path) if f.endswith(".png")],
+            key=extract_number
+        )
+
+        if not gt_hd_map_files:
+            print(f"Warning: No GT HD Map files found in directory: {gt_hd_map_path}")
+            return None
+
+        gt_hd_map_images = []
+        for idx in camera_indices:
+            if idx < len(gt_hd_map_files):
+                file_path = os.path.join(gt_hd_map_path, gt_hd_map_files[idx])
+                gt_hd_map_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                if gt_hd_map_image is None:
+                    print(f"Warning: Failed to load GT HD Map image: {file_path}")
+                    continue
+                gt_hd_map_image = cv2.resize(gt_hd_map_image, self.map_size)
+                gt_hd_map_images.append(gt_hd_map_image)
+
+        return np.array(gt_hd_map_images)
+
+    def _process_gt_hd_map(self, gt_hd_map_frame):
+        """
+        GT_HD_MAP 프레임을 BEV segmentation GT용으로 전처리합니다.
+        여기서는 HD Map과 동일한 방식으로 다중 채널 바이너리 마스크를 생성하지만,
+        실제 segmentation label 형식(예: single-channel class index)으로 변환하려면
+        색상 매핑 또는 다른 후처리 작업이 필요할 수 있습니다.
+        """
+        exterior = (gt_hd_map_frame[:, :, 0] > 200).astype(np.float32)
+        interior = (gt_hd_map_frame[:, :, 1] > 200).astype(np.float32)
+        lane = (gt_hd_map_frame[:, :, 2] > 200).astype(np.float32)
+        crosswalk = ((gt_hd_map_frame[:, :, 0] > 200) & (gt_hd_map_frame[:, :, 1] > 200)).astype(np.float32)
+        traffic_light = ((gt_hd_map_frame[:, :, 1] > 200) & (gt_hd_map_frame[:, :, 2] > 200)).astype(np.float32)
+        ego_vehicle = ((gt_hd_map_frame[:, :, 0] > 200) & (gt_hd_map_frame[:, :, 2] > 200)).astype(np.float32)
+        return np.stack([exterior, interior, lane, crosswalk, traffic_light, ego_vehicle], axis=0)

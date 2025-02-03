@@ -71,7 +71,7 @@ class DecoderBlock(torch.nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, dim, blocks, residual=True, factor=2, dim_last=64, dim_max=10):
+    def __init__(self, dim, blocks, residual=True, factor=2, dim_last=64, dim_max=6):
         super().__init__()
 
         layers = list()

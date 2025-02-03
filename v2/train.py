@@ -1,5 +1,7 @@
+import os
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
 from models.encoder import Encoder, HDMapFeaturePipeline, FeatureEmbedding, TrafficLightEncoder
 from models.decoder import TrafficSignClassificationHead, EgoStateHead, Decoder
@@ -8,7 +10,6 @@ from models.backbones.efficientnet import EfficientNetExtractor
 from models.control import FutureControlMLP
 from utils.attention import FeatureFusionAttention
 from dataloader.dataloader import camDataLoader
-
 
 class EndToEndModel(nn.Module):
     """
@@ -163,8 +164,8 @@ class EndToEndModel(nn.Module):
         return {
             "control": control_output,                      # control_output shape: [B, 3]
             "classification": classification_output,        # classification_output shape: [B, num_classes]
-            "future_ego": future_ego,                       # future_ego shape = [B, future_steps, 21]
-            "bev_seg": bev_decoding                         # bev_decoding shape: [B, time_steps, 64, 144, 144]
+            "future_ego": future_ego,                         # future_ego shape = [B, future_steps, 21]
+            "bev_seg": bev_decoding                         # bev_seg shape: [B, time_steps, 64, 144, 144]
         }
 
 
@@ -173,11 +174,11 @@ def get_dataloader(root_dir, num_timesteps=3, batch_size=1):
     데이터셋과 DataLoader 초기화 함수.
     """
     dataset = camDataLoader(root_dir, num_timesteps=num_timesteps)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     return dataloader
 
 
-def main():
+def train():
     # device 설정
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -195,37 +196,85 @@ def main():
     }
     
     # End-to-End 모델 초기화
-    model = EndToEndModel(config).to(device)
+    model = EndToEndModel(config)
+    
+    # 여러 GPU 사용을 위한 DataParallel 래핑
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training.")
+        model = nn.DataParallel(model)
+    
+    model = model.to(device)
+    
+    # 옵티마이저 및 손실 함수 정의
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    
+    # 각 헤드별 손실 함수
+    # - classification: CrossEntropyLoss (one-hot이 아닌 class index가 필요하다면, one-hot vector를 argmax하거나 loss 함수를 조정)
+    classification_loss_fn = nn.CrossEntropyLoss()
+    # - control 및 ego 예측: MSELoss
+    control_loss_fn = nn.MSELoss()
+    ego_loss_fn = nn.MSELoss()
+    # - bev segmentation: MSELoss (실제 적용 시 Dice loss, CrossEntropy 등으로 변경 가능)
+    seg_loss_fn = nn.MSELoss()
     
     # 데이터 로더 초기화 (root_dir 경로는 실제 데이터셋 경로로 수정)
     root_dir = "/home/vip1/hd/2025_HMG_AD/v2/Dataset_sample"
     dataloader = get_dataloader(root_dir, num_timesteps=3, batch_size=1)
     
-    # 배치 단위로 forward pass 수행
-    model.eval()
-    with torch.no_grad():
+    num_epochs = 10
+    model.train()
+    
+    for epoch in range(num_epochs):
+        running_loss = 0.0
         for batch_idx, data in enumerate(dataloader):
             # 데이터의 각 항목을 device로 이동
             batch = {
                 "image": data["images_input"].to(device),           # [B, num_views, C, H, W]
-                "intrinsics": data["intrinsic_input"].to(device),   # [B, num_views, 3, 3]
-                "extrinsics": data["extrinsic_input"].to(device),   # [B, num_views, 4, 4]
+                "intrinsics": data["intrinsic_input"].to(device),     # [B, num_views, 3, 3]
+                "extrinsics": data["extrinsic_input"].to(device),     # [B, num_views, 4, 4]
                 "hd_map": data["hd_map_input"].to(device),
                 "ego_info": data["ego_info"].to(device),
             }
             
-            ego_info_future_gt = data["ego_info_future"].to(device) # [B, 2, 21]
-            bev_seg_gt = data["gt_hd_map_input"].to(device)         # [B, T, 6, 144, 144]
-            traffic_gt = data["traffic"].to(device)                 # [B, C]
-            control_gt = data["control"].to(device)                 # [B, 3]
+            # Ground Truth (GT)
+            ego_info_future_gt = data["ego_info_future"].to(device)   # [B, future_steps, 21]
+            bev_seg_gt = data["gt_hd_map_input"].to(device)           # [B, T, 6, 144, 144]
+            # classification GT: 만약 one-hot 벡터이면, argmax를 통해 class index로 변환 (예시)
+            traffic_gt = data["traffic"].to(device)                   # [B, num_classes]
+            traffic_gt_indices = torch.argmax(traffic_gt, dim=1)        # [B]
+            control_gt = data["control"].to(device)                   # [B, 3]
             
+            optimizer.zero_grad()
             outputs = model(batch)
-            future_ego = outputs["future_ego"]                      # [B, 2, 21]
-            bev_seg = outputs["bev_seg"]                            # [B, T, 6, 144, 144]
-            traffic = outputs["classification"]                     # [B, C]
-            control = outputs["control"]                            # [B, 3]           
+            # 예측 결과
+            control_pred = outputs["control"]         # [B, 3]
+            classification_pred = outputs["classification"]   # [B, num_classes]
+            future_ego_pred = outputs["future_ego"]     # [B, future_steps, 21]
+            bev_seg_pred = outputs["bev_seg"]           # [B, time_steps, 64, 144, 144]
             
-            print(f"Batch {batch_idx}: control shape = {control.shape}, classification shape = {traffic.shape}")
+            # 손실 계산 (여러 헤드에 대해 개별 손실을 계산한 후, 가중합)
+            loss_classification = classification_loss_fn(classification_pred, traffic_gt_indices)
+            loss_control = control_loss_fn(control_pred, control_gt)
+            loss_ego = ego_loss_fn(future_ego_pred, ego_info_future_gt)
+            loss_seg = seg_loss_fn(bev_seg_pred, bev_seg_gt)
+            
+            # 총 손실 (가중치는 상황에 맞게 조정)
+            loss = loss_classification + loss_control + loss_ego + loss_seg
+            
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            
+            if batch_idx % 10 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
+        
+        epoch_loss = running_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{num_epochs}] Average Loss: {epoch_loss:.4f}")
+    
+    # 학습 후 모델 저장
+    torch.save(model.state_dict(), "end_to_end_model_parallel.pth")
+    print("Training complete and model saved.")
 
 if __name__ == "__main__":
-    main()
+    train()
