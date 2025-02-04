@@ -6,6 +6,26 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import re
+import logging
+
+# 로거 설정: 파일과 콘솔 모두에 로그를 기록
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# 파일 핸들러 (로그 파일 저장)
+file_handler = logging.FileHandler('data_loader_debug.log')
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
+file_handler.setFormatter(file_formatter)
+logger.addHandler(file_handler)
+
+# 콘솔 핸들러 (원하는 경우 주석처리 가능)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+
 
 class camDataLoader(Dataset):
     def __init__(self, root_dir, num_timesteps=3, image_size=(135, 240), map_size=(144, 144), 
@@ -42,10 +62,12 @@ class camDataLoader(Dataset):
         # Calibration 파일 로드
         calibration_dir = os.path.join(root_dir, "Calibration")
         assert os.path.isdir(calibration_dir), f"Calibration directory not found: {calibration_dir}"
+        logger.debug(f"Calibration directory found: {calibration_dir}")
 
         camera_files = [f for f in os.listdir(calibration_dir) if f.endswith(".npy")]
         camera_ids = sorted(set(f.split("__")[0] for f in camera_files))
         self.num_cameras = len(camera_ids)
+        logger.debug(f"Found camera IDs: {camera_ids}")
 
         self.intrinsic_data = []
         self.extrinsic_data = []
@@ -56,6 +78,10 @@ class camDataLoader(Dataset):
             assert os.path.isfile(intrinsic_file), f"Intrinsic file not found: {intrinsic_file}"
             assert os.path.isfile(extrinsic_file), f"Extrinsic file not found: {extrinsic_file}"
 
+            logger.debug(f"Loading calibration files for camera {camera_id}:")
+            logger.debug(f"    Intrinsic: {intrinsic_file}")
+            logger.debug(f"    Extrinsic: {extrinsic_file}")
+
             self.intrinsic_data.append(torch.tensor(np.load(intrinsic_file), dtype=torch.float32))
             self.extrinsic_data.append(torch.tensor(np.load(extrinsic_file), dtype=torch.float32))
 
@@ -64,6 +90,7 @@ class camDataLoader(Dataset):
             [os.path.join(root_dir, d) for d in os.listdir(root_dir)
              if os.path.isdir(os.path.join(root_dir, d)) and d.startswith("R_KR_")]
         )
+        logger.debug(f"Found scenario directories: {self.scenario_dirs}")
 
         # 각 시나리오별로 CAMERA, EGO_INFO, TRAFFIC_INFO 데이터 수집
         self.camera_data = []  # (scenario_dir, [카메라별 이미지 파일 리스트])
@@ -71,12 +98,14 @@ class camDataLoader(Dataset):
         self.traffic_data = [] # 각 시나리오의 TRAFFIC_INFO 파일 경로 리스트 (EGO_INFO와 순서 일치)
 
         for scenario_dir in self.scenario_dirs:
+            logger.debug(f"Processing scenario directory: {scenario_dir}")
             # CAMERA 데이터 처리
             camera_dirs = sorted(
                 [os.path.join(scenario_dir, d) for d in os.listdir(scenario_dir)
                  if d.upper().startswith("CAMERA_")]
             )
             assert camera_dirs, f"No CAMERA_* folders found in {scenario_dir}"
+            logger.debug(f"Found CAMERA directories: {camera_dirs}")
 
             camera_files = []
             for camera_dir in camera_dirs:
@@ -85,6 +114,7 @@ class camDataLoader(Dataset):
                     [os.path.join(camera_dir, f) for f in os.listdir(camera_dir) if f.endswith(".jpeg")]
                 )
                 assert files, f"No .jpeg files found in {camera_dir}"
+                logger.debug(f"Camera directory {camera_dir} has {len(files)} image files. Sample: {files[:2]}")
                 camera_files.append(files)
             # 모든 카메라가 동일한 프레임 수를 가지고 있는지 확인
             num_frames = len(camera_files[0])
@@ -100,6 +130,7 @@ class camDataLoader(Dataset):
                 [os.path.join(ego_info_path, f) for f in os.listdir(ego_info_path) if f.endswith(".txt")]
             )
             assert ego_files, f"No EGO_INFO files found in {ego_info_path}"
+            logger.debug(f"EGO_INFO files in {ego_info_path}: {ego_files[:2]} ... (총 {len(ego_files)}개)")
             self.ego_data.append(ego_files)
 
             # TRAFFIC_INFO 파일 처리 (EGO_INFO 시퀀스와 동일한 순서로 정렬)
@@ -109,14 +140,16 @@ class camDataLoader(Dataset):
                     [os.path.join(traffic_info_path, f) for f in os.listdir(traffic_info_path) if f.endswith(".txt")]
                 )
                 if len(traffic_files) != len(ego_files):
-                    print(f"Warning: Number of TRAFFIC_INFO files ({len(traffic_files)}) does not match EGO_INFO files ({len(ego_files)}) in {scenario_dir}")
+                    logger.warning(f"Number of TRAFFIC_INFO files ({len(traffic_files)}) does not match EGO_INFO files ({len(ego_files)}) in {scenario_dir}")
+                logger.debug(f"TRAFFIC_INFO files in {traffic_info_path}: {traffic_files[:2]} ... (총 {len(traffic_files)}개)")
                 self.traffic_data.append(traffic_files)
             else:
-                print(f"Warning: TRAFFIC_INFO directory not found: {traffic_info_path}")
+                logger.warning(f"TRAFFIC_INFO directory not found: {traffic_info_path}")
                 self.traffic_data.append(None)
 
         # 총 샘플 수 계산 (각 샘플은 total_steps 프레임을 필요로 함)
         self.num_frames = sum(len(camera_files[0]) - self.total_steps + 1 for _, camera_files in self.camera_data)
+        logger.debug(f"Total number of samples: {self.num_frames}")
 
     def __len__(self):
         return self.num_frames
@@ -135,22 +168,25 @@ class camDataLoader(Dataset):
         ego_info_data = []
         control_info_data = []
         traffic_class_seq = []   # 입력 시퀀스 내 프레임에 해당하는 traffic classification 값을 저장
-        camera_indices = []
+        camera_indices = []      # 카메라 이미지 인덱스를 저장 (각 시점이 동일한 기준을 사용)
 
-        # total_steps 만큼 반복 (입력 프레임 + 미래 GT 프레임은 EGO_INFO 및 이미지 처리에 사용)
+        # total_steps 만큼 반복 (입력 프레임 + 미래 GT 프레임 모두 동일 인덱스로 로드)
         for t in range(self.total_steps):
             # --- 이미지 로드 (CAMERA) ---
             images_per_camera = []
             for cam_idx in range(len(camera_files)):
                 image_path = camera_files[cam_idx][frame_idx + t]
+                logger.debug(f"Loading image file: {image_path}")
                 image = Image.open(image_path).convert("RGB")
                 image = self.image_transform(image)
                 images_per_camera.append(image)
+            # 카메라 이미지의 인덱스를 그대로 사용하여 다른 모달리티(HD_MAP 등)와 정렬
             camera_indices.append(frame_idx + t)
             temporal_images.append(torch.stack(images_per_camera, dim=0))  # (num_cameras, C, H, W)
 
             # --- EGO_INFO 파일 로드 ---
             ego_file_path = self.ego_data[scenario_idx][frame_idx + t]
+            logger.debug(f"Loading EGO_INFO file: {ego_file_path}")
             ego_info_dict = {}
             with open(ego_file_path, 'r') as f:
                 for line in f:
@@ -188,6 +224,7 @@ class camDataLoader(Dataset):
                     ego_traffic_id = ego_info_dict["trafficlightid"]
                     if self.traffic_data[scenario_idx] is not None:
                         traffic_file_path = self.traffic_data[scenario_idx][frame_idx + t]
+                        logger.debug(f"Loading TRAFFIC_INFO file: {traffic_file_path}")
                         with open(traffic_file_path, 'r') as f_traffic:
                             traffic_dict = {}
                             for line in f_traffic:
@@ -215,7 +252,7 @@ class camDataLoader(Dataset):
         ego_info_input = ego_info_tensor[:self.num_timesteps]      # (num_timesteps, feature_dim)
         ego_info_future = ego_info_tensor[self.num_timesteps:]       # (future_steps, feature_dim)
         control_info_tensor = torch.tensor(control_info_data, dtype=torch.float32)
-        control_info_future = control_info_tensor[self.num_timesteps+1:]
+        control_info_future = control_info_tensor[self.num_timesteps:]
         
         # --- 이미지 데이터 (CAMERA) ---
         # temporal_images: 리스트 길이 total_steps, 각 원소 (num_cameras, C, H, W)
@@ -238,6 +275,8 @@ class camDataLoader(Dataset):
         extrinsic_future = extrinsic[self.num_timesteps:]
 
         # --- HD Map 데이터 로드 및 전처리 ---
+        # camera_indices 리스트는 카메라 이미지 인덱스를 그대로 사용하므로, 
+        # HD_MAP 파일도 동일 인덱스로 로드하여 모든 시점이 맞도록 합니다.
         hd_map_images = self._load_hd_map(scenario_dir, camera_indices)
         hd_map_input = None
         hd_map_future = None
@@ -286,12 +325,18 @@ class camDataLoader(Dataset):
 
         return np.stack([exterior, interior, lane, crosswalk, traffic_light, ego_vehicle], axis=0)
 
-    def _load_hd_map(self, scenario_path, camera_indices):
-        """HD Map 이미지를 불러오고, 카메라 인덱스와 동기화."""
+    def _load_hd_map(self, scenario_path, frame_indices):
+        """
+        HD Map 이미지를 불러오고, 카메라 이미지의 frame index에 맞춰 동기화합니다.
+        
+        Args:
+            scenario_path (str): 현재 시나리오 디렉토리.
+            frame_indices (list[int]): 각 시점에 해당하는 카메라 이미지의 frame index 리스트.
+        """
         hd_map_path = os.path.join(scenario_path, self.hd_map_dir)
 
         if not os.path.exists(hd_map_path):
-            print(f"Warning: HD Map directory not found: {hd_map_path}")
+            logger.warning(f"HD Map directory not found: {hd_map_path}")
             return None
 
         def extract_number(file_name):
@@ -304,28 +349,33 @@ class camDataLoader(Dataset):
         )
 
         if not hd_map_files:
-            print(f"Warning: No HD Map files found in directory: {hd_map_path}")
+            logger.warning(f"No HD Map files found in directory: {hd_map_path}")
             return None
 
         hd_map_images = []
-        for idx in camera_indices:
+        for idx in frame_indices:
             if idx < len(hd_map_files):
                 file_path = os.path.join(hd_map_path, hd_map_files[idx])
+                logger.debug(f"Loading HD Map file: {file_path}")
                 hd_map_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
                 if hd_map_image is None:
-                    print(f"Warning: Failed to load HD Map image: {file_path}")
+                    logger.warning(f"Failed to load HD Map image: {file_path}")
                     continue
                 hd_map_image = cv2.resize(hd_map_image, self.map_size)
                 hd_map_images.append(hd_map_image)
-
+            else:
+                logger.warning(f"Frame index {idx} exceeds number of HD Map files in {hd_map_path}")
         return np.array(hd_map_images)
 
-    def _load_gt_hd_map(self, scenario_path, camera_indices):
-        """GT_HD_MAP 폴더에서 BEV segmentation GT용 HD Map 이미지를 불러오고, 카메라 인덱스와 동기화."""
+    def _load_gt_hd_map(self, scenario_path, frame_indices):
+        """
+        GT_HD_MAP 폴더에서 BEV segmentation GT용 HD Map 이미지를 불러오고,
+        카메라 이미지의 frame index에 맞춰 동기화합니다.
+        """
         gt_hd_map_path = os.path.join(scenario_path, self.gt_hd_map_dir)
 
         if not os.path.exists(gt_hd_map_path):
-            print(f"Warning: GT HD Map directory not found: {gt_hd_map_path}")
+            logger.warning(f"GT HD Map directory not found: {gt_hd_map_path}")
             return None
 
         def extract_number(file_name):
@@ -338,28 +388,28 @@ class camDataLoader(Dataset):
         )
 
         if not gt_hd_map_files:
-            print(f"Warning: No GT HD Map files found in directory: {gt_hd_map_path}")
+            logger.warning(f"No GT HD Map files found in directory: {gt_hd_map_path}")
             return None
 
         gt_hd_map_images = []
-        for idx in camera_indices:
+        for idx in frame_indices:
             if idx < len(gt_hd_map_files):
                 file_path = os.path.join(gt_hd_map_path, gt_hd_map_files[idx])
+                logger.debug(f"Loading GT HD Map file: {file_path}")
                 gt_hd_map_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
                 if gt_hd_map_image is None:
-                    print(f"Warning: Failed to load GT HD Map image: {file_path}")
+                    logger.warning(f"Failed to load GT HD Map image: {file_path}")
                     continue
                 gt_hd_map_image = cv2.resize(gt_hd_map_image, self.map_size)
                 gt_hd_map_images.append(gt_hd_map_image)
-
+            else:
+                logger.warning(f"Frame index {idx} exceeds number of GT HD Map files in {gt_hd_map_path}")
         return np.array(gt_hd_map_images)
 
     def _process_gt_hd_map(self, gt_hd_map_frame):
         """
         GT_HD_MAP 프레임을 BEV segmentation GT용으로 전처리합니다.
-        여기서는 HD Map과 동일한 방식으로 다중 채널 바이너리 마스크를 생성하지만,
-        실제 segmentation label 형식(예: single-channel class index)으로 변환하려면
-        색상 매핑 또는 다른 후처리 작업이 필요할 수 있습니다.
+        여기서는 HD Map과 동일한 방식으로 다중 채널 바이너리 마스크를 생성합니다.
         """
         exterior = (gt_hd_map_frame[:, :, 0] > 200).astype(np.float32)
         interior = (gt_hd_map_frame[:, :, 1] > 200).astype(np.float32)
