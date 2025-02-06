@@ -19,14 +19,26 @@ file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", da
 file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
-# 콘솔 핸들러 (원하는 경우 주석처리 가능)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
-console_handler.setFormatter(console_formatter)
-logger.addHandler(console_handler)
+# -------------------------------------------------------------------
+# EGO_INFO 파일 내부에서 실제 프레임 번호를 추출하는 함수
+def get_ego_frame(file_path):
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                # 예: "frame: 690" 혹은 "Frame: 690" 등
+                if "frame:" in line.lower():
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        frame_num = parts[1].strip()
+                        return int(frame_num)
+    except Exception as e:
+        logger.warning(f"Error reading {file_path}: {e}")
+    # 내부에서 찾지 못하면 파일 이름에서 추출 (예: "690.txt")
+    basename = os.path.basename(file_path)
+    match = re.search(r'(\d+)', basename)
+    return int(match.group(1)) if match else -1
 
-
+# -------------------------------------------------------------------
 class camDataLoader(Dataset):
     def __init__(self, root_dir, num_timesteps=3, image_size=(135, 240), map_size=(144, 144), 
                  hd_map_dir="HD_MAP", gt_hd_map_dir="GT_HD_MAP", ego_info_dir="EGO_INFO", 
@@ -86,91 +98,145 @@ class camDataLoader(Dataset):
             self.extrinsic_data.append(torch.tensor(np.load(extrinsic_file), dtype=torch.float32))
 
         # 시나리오 폴더 로드
-        self.scenario_dirs = sorted(
+        def extract_scenario_number(scenario_name):
+            match = re.search(r'(\d+)', scenario_name)
+            return int(match.group(1)) if match else float('inf')
+
+        all_scenario_dirs = sorted(
             [os.path.join(root_dir, d) for d in os.listdir(root_dir)
-             if os.path.isdir(os.path.join(root_dir, d)) and d.startswith("R_KR_")]
+             if os.path.isdir(os.path.join(root_dir, d)) and d.startswith("R_KR_")],
+            key=extract_scenario_number
         )
-        logger.debug(f"Found scenario directories: {self.scenario_dirs}")
+        logger.debug(f"Found scenario directories: {all_scenario_dirs}")
 
-        # 각 시나리오별로 CAMERA, EGO_INFO, TRAFFIC_INFO 데이터 수집
-        self.camera_data = []  # (scenario_dir, [카메라별 이미지 파일 리스트])
-        self.ego_data = []     # 각 시나리오의 EGO_INFO 파일 경로 리스트
-        self.traffic_data = [] # 각 시나리오의 TRAFFIC_INFO 파일 경로 리스트 (EGO_INFO와 순서 일치)
+        # 내부에서 사용할 extract_number 함수 (파일명 내 숫자 추출)
+        def extract_number(file_path):
+            basename = os.path.basename(file_path)
+            match = re.search(r'(\d+)', basename)
+            return int(match.group(1)) if match else -1
 
-        for scenario_dir in self.scenario_dirs:
+        # 각 시나리오별 데이터(카메라, EGO_INFO, TRAFFIC_INFO) 수집 및 valid index 계산
+        # 전체 시나리오에서 _전체 시퀀스를 구성할 수 있는 시작 인덱스_ (즉, valid sample)만 valid_indices에 등록합니다.
+        self.scenario_dirs = []  # valid 시나리오 디렉토리들 (부분적으로 사용)
+        self.camera_data = []    # 각 시나리오의 카메라 파일 리스트 (리스트 내에 카메라별 이미지 리스트)
+        self.ego_data = []       # 각 시나리오의 필터링된 EGO_INFO 파일 리스트
+        self.traffic_data = []   # 각 시나리오의 필터링된 TRAFFIC_INFO 파일 리스트 (없으면 None)
+        self.valid_indices = []  # 전체 데이터셋에서 (시나리오 idx, 시작 프레임 인덱스) 튜플 리스트
+
+        for scenario_dir in all_scenario_dirs:
             logger.debug(f"Processing scenario directory: {scenario_dir}")
             # CAMERA 데이터 처리
             camera_dirs = sorted(
                 [os.path.join(scenario_dir, d) for d in os.listdir(scenario_dir)
                  if d.upper().startswith("CAMERA_")]
             )
-            assert camera_dirs, f"No CAMERA_* folders found in {scenario_dir}"
+            if not camera_dirs:
+                logger.warning(f"No CAMERA_* folders found in {scenario_dir}. Skipping scenario.")
+                continue
             logger.debug(f"Found CAMERA directories: {camera_dirs}")
 
             camera_files = []
             for camera_dir in camera_dirs:
-                assert os.path.isdir(camera_dir), f"{camera_dir} is not a directory"
+                if not os.path.isdir(camera_dir):
+                    logger.warning(f"{camera_dir} is not a directory. Skipping scenario.")
+                    continue
                 files = sorted(
-                    [os.path.join(camera_dir, f) for f in os.listdir(camera_dir) if f.endswith(".jpeg")]
+                    [os.path.join(camera_dir, f) for f in os.listdir(camera_dir) if f.endswith(".jpeg")],
+                    key=extract_number
                 )
-                assert files, f"No .jpeg files found in {camera_dir}"
+                if not files:
+                    logger.warning(f"No .jpeg files found in {camera_dir}. Skipping scenario.")
+                    continue
                 logger.debug(f"Camera directory {camera_dir} has {len(files)} image files. Sample: {files[:2]}")
                 camera_files.append(files)
+            if not camera_files:
+                continue
             # 모든 카메라가 동일한 프레임 수를 가지고 있는지 확인
-            num_frames = len(camera_files[0])
-            assert all(len(files) == num_frames for files in camera_files), (
-                f"Mismatch in number of frames across cameras in {scenario_dir}"
-            )
-            self.camera_data.append((scenario_dir, camera_files))
+            num_camera_frames = len(camera_files[0])
+            if not all(len(files) == num_camera_frames for files in camera_files):
+                logger.warning(f"Mismatch in number of frames across cameras in {scenario_dir}. Skipping scenario.")
+                continue
 
-            # EGO_INFO 파일 처리
+            # EGO_INFO 파일 처리 (내부 프레임 번호 기준 정렬)
             ego_info_path = os.path.join(scenario_dir, self.ego_info_dir)
-            assert os.path.isdir(ego_info_path), f"EGO_INFO directory not found: {ego_info_path}"
+            if not os.path.isdir(ego_info_path):
+                logger.warning(f"EGO_INFO directory not found: {ego_info_path}. Skipping scenario.")
+                continue
             ego_files = sorted(
-                [os.path.join(ego_info_path, f) for f in os.listdir(ego_info_path) if f.endswith(".txt")]
+                [os.path.join(ego_info_path, f) for f in os.listdir(ego_info_path) if f.endswith(".txt")],
+                key=get_ego_frame
             )
-            assert ego_files, f"No EGO_INFO files found in {ego_info_path}"
+            if not ego_files:
+                logger.warning(f"No EGO_INFO files found in {ego_info_path}. Skipping scenario.")
+                continue
             logger.debug(f"EGO_INFO files in {ego_info_path}: {ego_files[:2]} ... (총 {len(ego_files)}개)")
-            self.ego_data.append(ego_files)
 
-            # TRAFFIC_INFO 파일 처리 (EGO_INFO 시퀀스와 동일한 순서로 정렬)
+            # EGO_INFO 파일 필터링: 내부의 프레임 번호가 10의 배수인 경우만 사용
+            filtered_ego_files = [f for f in ego_files if get_ego_frame(f) % 10 == 0]
+            if len(filtered_ego_files) < self.total_steps:
+                logger.warning(f"Not enough filtered EGO_INFO files in {ego_info_path} for a full sequence. Skipping scenario.")
+                continue
+
+            # TRAFFIC_INFO 파일 처리 및 필터링 (EGO_INFO와 동일한 기준 적용)
             traffic_info_path = os.path.join(scenario_dir, self.traffic_info_dir)
             if os.path.isdir(traffic_info_path):
                 traffic_files = sorted(
-                    [os.path.join(traffic_info_path, f) for f in os.listdir(traffic_info_path) if f.endswith(".txt")]
+                    [os.path.join(traffic_info_path, f) for f in os.listdir(traffic_info_path) if f.endswith(".txt")],
+                    key=extract_number
                 )
-                if len(traffic_files) != len(ego_files):
-                    logger.warning(f"Number of TRAFFIC_INFO files ({len(traffic_files)}) does not match EGO_INFO files ({len(ego_files)}) in {scenario_dir}")
-                logger.debug(f"TRAFFIC_INFO files in {traffic_info_path}: {traffic_files[:2]} ... (총 {len(traffic_files)}개)")
-                self.traffic_data.append(traffic_files)
+                # EGO_INFO와 같은 수라면 동일하게 10의 배수 조건으로 필터링
+                if len(traffic_files) == len(ego_files):
+                    filtered_traffic_files = [f for f in traffic_files if extract_number(f) % 10 == 0]
+                else:
+                    filtered_traffic_files = traffic_files
+                if len(filtered_traffic_files) != len(filtered_ego_files):
+                    logger.warning(f"Number of filtered TRAFFIC_INFO files ({len(filtered_traffic_files)}) does not match filtered EGO_INFO files ({len(filtered_ego_files)}) in {scenario_dir}.")
+                traffic_entry = filtered_traffic_files
             else:
                 logger.warning(f"TRAFFIC_INFO directory not found: {traffic_info_path}")
-                self.traffic_data.append(None)
+                traffic_entry = None
 
-        # 총 샘플 수 계산 (각 샘플은 total_steps 프레임을 필요로 함)
-        self.num_frames = sum(len(camera_files[0]) - self.total_steps + 1 for _, camera_files in self.camera_data)
-        logger.debug(f"Total number of samples: {self.num_frames}")
+            # 각 시나리오 내에서 전체 total_steps(예: 5) 프레임을 구성할 수 있는 시작 인덱스만 valid하게 사용
+            # (예: num_camera_frames가 100이라면, 시작 인덱스 0 ~ (100 - total_steps) 까지만 사용)
+            num_valid_samples = min(num_camera_frames, len(filtered_ego_files)) - self.total_steps + 1
+            if num_valid_samples <= 0:
+                logger.warning(f"Not enough frames in scenario {scenario_dir} to form a full sequence. Skipping scenario.")
+                continue
+
+            # valid한 시나리오 데이터를 별도 리스트에 저장
+            self.scenario_dirs.append(scenario_dir)
+            self.camera_data.append(camera_files)
+            self.ego_data.append(filtered_ego_files)
+            self.traffic_data.append(traffic_entry)
+
+            # 해당 시나리오 내에서 각 valid 시작 인덱스를 전역 valid index에 등록
+            # (각 튜플: (해당 valid 시나리오 내 인덱스, 시작 frame index))
+            for start_idx in range(num_valid_samples):
+                self.valid_indices.append((len(self.scenario_dirs) - 1, start_idx))
+
+        logger.debug(f"Total number of valid samples: {len(self.valid_indices)}")
 
     def __len__(self):
-        return self.num_frames
+        return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        # idx가 속하는 시나리오와 해당 프레임 인덱스 결정
-        cumulative_frames = 0
-        for scenario_idx, (scenario_dir, camera_files) in enumerate(self.camera_data):
-            num_scenario_frames = len(camera_files[0]) - self.total_steps + 1
-            if idx < cumulative_frames + num_scenario_frames:
-                frame_idx = idx - cumulative_frames
-                break
-            cumulative_frames += num_scenario_frames
+        # valid_indices 매핑을 사용하여 시나리오와 시작 프레임 인덱스를 결정
+        try:
+            scenario_idx, frame_idx = self.valid_indices[idx]
+        except IndexError:
+            raise IndexError("Index out of range in dataset.")
+
+        scenario_dir = self.scenario_dirs[scenario_idx]
+        camera_files = self.camera_data[scenario_idx]
+        ego_files = self.ego_data[scenario_idx]
+        traffic_files = self.traffic_data[scenario_idx]  # None일 수도 있음
 
         temporal_images = []
         ego_info_data = []
         control_info_data = []
-        traffic_class_seq = []   # 입력 시퀀스 내 프레임에 해당하는 traffic classification 값을 저장
-        camera_indices = []      # 카메라 이미지 인덱스를 저장 (각 시점이 동일한 기준을 사용)
+        traffic_class_seq = []   # 입력 시퀀스 내 프레임별 traffic classification 값
 
-        # total_steps 만큼 반복 (입력 프레임 + 미래 GT 프레임 모두 동일 인덱스로 로드)
+        # total_steps(예: 5) 프레임에 대해 데이터를 로드
         for t in range(self.total_steps):
             # --- 이미지 로드 (CAMERA) ---
             images_per_camera = []
@@ -180,12 +246,10 @@ class camDataLoader(Dataset):
                 image = Image.open(image_path).convert("RGB")
                 image = self.image_transform(image)
                 images_per_camera.append(image)
-            # 카메라 이미지의 인덱스를 그대로 사용하여 다른 모달리티(HD_MAP 등)와 정렬
-            camera_indices.append(frame_idx + t)
             temporal_images.append(torch.stack(images_per_camera, dim=0))  # (num_cameras, C, H, W)
 
             # --- EGO_INFO 파일 로드 ---
-            ego_file_path = self.ego_data[scenario_idx][frame_idx + t]
+            ego_file_path = ego_files[frame_idx + t]
             logger.debug(f"Loading EGO_INFO file: {ego_file_path}")
             ego_info_dict = {}
             with open(ego_file_path, 'r') as f:
@@ -201,29 +265,26 @@ class camDataLoader(Dataset):
                                 ego_info_dict["control"] = []
                             ego_info_dict["control"].append(float(value))
                         elif key == "trafficlightid":
-                            # trafficlightid는 문자열 그대로 저장 (예: "C119BS010046")
                             ego_info_dict["trafficlightid"] = value
-
-            # flatten: 기존 키들에 대해 (없으면 길이 3의 0.0 벡터로 채움)
+            # flatten: 각 키에 대해 값이 없으면 기본값 [0.0, 0.0, 0.0] 사용
             ego_info_values = []
             for k in ["position", "orientation", "enu_velocity", "velocity", "angularVelocity", "acceleration", "control"]:
                 default_length = 3
                 ego_info_values.extend(ego_info_dict.get(k, [0.0] * default_length))
             ego_info_data.append(ego_info_values)
-            
-            # control 부분만 따로 저장
+
+            # control 정보만 따로 저장
             control_data = ego_info_dict.get("control", [0.0] * 3)
             control_info_data.append(control_data)
-            
-            # --- TRAFFIC_INFO 파일 로드 및 traffic classification 결정 ---
-            # 입력 시퀀스(frames 0 ~ num_timesteps-1)에 대해서만 처리
+
+            # --- TRAFFIC_INFO 파일 로드 및 traffic classification 결정 (입력 시퀀스에 대해서만) ---
             if t < self.num_timesteps:
                 if "trafficlightid" not in ego_info_dict or ego_info_dict["trafficlightid"] in [None, "", "null"]:
                     traffic_class = 0
                 else:
                     ego_traffic_id = ego_info_dict["trafficlightid"]
-                    if self.traffic_data[scenario_idx] is not None:
-                        traffic_file_path = self.traffic_data[scenario_idx][frame_idx + t]
+                    if traffic_files is not None:
+                        traffic_file_path = traffic_files[frame_idx + t]
                         logger.debug(f"Loading TRAFFIC_INFO file: {traffic_file_path}")
                         with open(traffic_file_path, 'r') as f_traffic:
                             traffic_dict = {}
@@ -233,66 +294,60 @@ class camDataLoader(Dataset):
                                     k2 = k2.strip()
                                     tokens = v2.strip().split()
                                     if tokens:
-                                        # 마지막 토큰을 분류값(정수형)으로 사용
                                         traffic_dict[k2] = int(tokens[-1])
                         traffic_class = traffic_dict.get(ego_traffic_id, 0)
                     else:
                         traffic_class = 0
                 traffic_class_seq.append(traffic_class)
 
-        # 최종 traffic classification 값은 입력 시퀀스의 마지막 프레임(현재 프레임)의 값 사용
+        # 최종 traffic classification: 입력 시퀀스의 마지막 프레임 값 사용
         current_traffic_class = traffic_class_seq[-1] if traffic_class_seq else 0
-        # one-hot 인코딩: traffic GT를 (클래스 수,) 형태의 벡터로 변환
         traffic_gt = torch.zeros(self.num_traffic_classes, dtype=torch.float32)
         if current_traffic_class < self.num_traffic_classes:
             traffic_gt[current_traffic_class] = 1.0
 
         # EGO_INFO 텐서 생성 및 입력/미래 분리
         ego_info_tensor = torch.tensor(ego_info_data, dtype=torch.float32)  # (total_steps, feature_dim)
-        ego_info_input = ego_info_tensor[:self.num_timesteps]      # (num_timesteps, feature_dim)
-        ego_info_future = ego_info_tensor[self.num_timesteps:]       # (future_steps, feature_dim)
+        ego_info_input = ego_info_tensor[:self.num_timesteps]
+        ego_info_future = ego_info_tensor[self.num_timesteps:]
         control_info_tensor = torch.tensor(control_info_data, dtype=torch.float32)
         control_info_future = control_info_tensor[self.num_timesteps:]
-        
+
         # --- 이미지 데이터 (CAMERA) ---
-        # temporal_images: 리스트 길이 total_steps, 각 원소 (num_cameras, C, H, W)
-        # 스택 후 (total_steps, num_cameras, C, H, W)로 변환
         temporal_images = torch.stack(temporal_images, dim=1)  # (num_cameras, total_steps, C, H, W)
         temporal_images = temporal_images.permute(1, 0, 2, 3, 4)  # (total_steps, num_cameras, C, H, W)
-        images_input = temporal_images[:self.num_timesteps]       # (num_timesteps, num_cameras, C, H, W)
-        images_future = temporal_images[self.num_timesteps:]        # (future_steps, num_cameras, C, H, W)
+        images_input = temporal_images[:self.num_timesteps]
+        images_future = temporal_images[self.num_timesteps:]
 
         # --- Calibration (intrinsic & extrinsic) ---
         intrinsic = torch.stack(self.intrinsic_data, dim=0).unsqueeze(1).repeat(1, self.total_steps, 1, 1)
         extrinsic = torch.stack(self.extrinsic_data, dim=0).unsqueeze(1).repeat(1, self.total_steps, 1, 1)
-
         intrinsic = intrinsic.permute(1, 0, 2, 3)  # (total_steps, num_cameras, 3, 3)
         extrinsic = extrinsic.permute(1, 0, 2, 3)  # (total_steps, num_cameras, 4, 4)
-
         intrinsic_input = intrinsic[:self.num_timesteps]
         intrinsic_future = intrinsic[self.num_timesteps:]
         extrinsic_input = extrinsic[:self.num_timesteps]
         extrinsic_future = extrinsic[self.num_timesteps:]
 
         # --- HD Map 데이터 로드 및 전처리 ---
-        # camera_indices 리스트는 카메라 이미지 인덱스를 그대로 사용하므로, 
-        # HD_MAP 파일도 동일 인덱스로 로드하여 모든 시점이 맞도록 합니다.
-        hd_map_images = self._load_hd_map(scenario_dir, camera_indices)
+        hd_map_indices = [frame_idx + t for t in range(self.total_steps)]
+        hd_map_images = self._load_hd_map(scenario_dir, hd_map_indices)
         hd_map_input = None
         hd_map_future = None
         if hd_map_images is not None:
             hd_map_images = np.stack([self._process_hd_map(frame) for frame in hd_map_images])
-            hd_map_images = torch.tensor(hd_map_images, dtype=torch.float32)  # (total_steps, channels, H, W)
+            hd_map_images = torch.tensor(hd_map_images, dtype=torch.float32)
             hd_map_input = hd_map_images[:self.num_timesteps]
             hd_map_future = hd_map_images[self.num_timesteps:]
 
         # --- GT HD Map 데이터 로드 및 전처리 (BEV segmentation GT) ---
-        gt_hd_map_images = self._load_gt_hd_map(scenario_dir, camera_indices)
+        gt_hd_map_indices = [frame_idx + t for t in range(self.total_steps)]
+        gt_hd_map_images = self._load_gt_hd_map(scenario_dir, gt_hd_map_indices)
         gt_hd_map_input = None
         gt_hd_map_future = None
         if gt_hd_map_images is not None:
             gt_hd_map_images = np.stack([self._process_gt_hd_map(frame) for frame in gt_hd_map_images])
-            gt_hd_map_images = torch.tensor(gt_hd_map_images, dtype=torch.float32)  # (total_steps, channels, H, W)
+            gt_hd_map_images = torch.tensor(gt_hd_map_images, dtype=torch.float32)
             gt_hd_map_input = gt_hd_map_images[:self.num_timesteps]
             gt_hd_map_future = gt_hd_map_images[self.num_timesteps:]
 
@@ -305,49 +360,46 @@ class camDataLoader(Dataset):
             "extrinsic_future": extrinsic_future,   # (future_steps, num_cameras, 4, 4)
             "hd_map_input": hd_map_input,           # (num_timesteps, channels, H, W) 또는 None
             "hd_map_future": hd_map_future,         # (future_steps, channels, H, W) 또는 None
-            "gt_hd_map_input": gt_hd_map_input,       # (num_timesteps, channels, H, W) 또는 None (BEV segmentation GT)
-            "gt_hd_map_future": gt_hd_map_future,     # (future_steps, channels, H, W) 또는 None (BEV segmentation GT)
+            "gt_hd_map_input": gt_hd_map_input,       # (num_timesteps, channels, H, W) 또는 None
+            "gt_hd_map_future": gt_hd_map_future,     # (future_steps, channels, H, W) 또는 None
             "ego_info": ego_info_input,             # (num_timesteps, feature_dim)
             "ego_info_future": ego_info_future,     # (future_steps, feature_dim)
-            "traffic": traffic_gt,                  # (num_traffic_classes,) -> DataLoader에서 (배치, num_traffic_classes)로 조합됨.
+            "traffic": traffic_gt,                  # (num_traffic_classes,)
             "scenario": scenario_dir,
             "control": control_info_future
         }
 
     def _process_hd_map(self, hd_map_frame):
         """HD Map 프레임을 다중 채널 텐서로 전처리."""
-        exterior = (hd_map_frame[:, :, 0] > 200).astype(np.float32)  # Red channel
-        interior = (hd_map_frame[:, :, 1] > 200).astype(np.float32)  # Green channel
-        lane = (hd_map_frame[:, :, 2] > 200).astype(np.float32)      # Blue channel
-        crosswalk = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 1] > 200)).astype(np.float32)  # Yellow
-        traffic_light = ((hd_map_frame[:, :, 1] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)  # Cyan
-        ego_vehicle = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)  # Magenta
-
+        exterior = (hd_map_frame[:, :, 0] > 200).astype(np.float32)
+        interior = (hd_map_frame[:, :, 1] > 200).astype(np.float32)
+        lane = (hd_map_frame[:, :, 2] > 200).astype(np.float32)
+        crosswalk = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 1] > 200)).astype(np.float32)
+        traffic_light = ((hd_map_frame[:, :, 1] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)
+        ego_vehicle = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)
         return np.stack([exterior, interior, lane, crosswalk, traffic_light, ego_vehicle], axis=0)
 
     def _load_hd_map(self, scenario_path, frame_indices):
         """
-        HD Map 이미지를 불러오고, 카메라 이미지의 frame index에 맞춰 동기화합니다.
-        
+        HD Map 이미지를 불러오고, 파일명을 숫자로 변환해 정렬된 순서로 로드합니다.
         Args:
             scenario_path (str): 현재 시나리오 디렉토리.
-            frame_indices (list[int]): 각 시점에 해당하는 카메라 이미지의 frame index 리스트.
+            frame_indices (list[int]): 순차적 인덱스 리스트 (0,1,2, ...).
         """
         hd_map_path = os.path.join(scenario_path, self.hd_map_dir)
-
         if not os.path.exists(hd_map_path):
             logger.warning(f"HD Map directory not found: {hd_map_path}")
             return None
 
         def extract_number(file_name):
-            match = re.search(r'(\d+)', file_name)
-            return int(match.group(1)) if match else float('inf')
+            m = re.search(r'EGO_(\d+)', file_name)
+            return int(m.group(1)) if m else float('inf')
 
         hd_map_files = sorted(
-            [f for f in os.listdir(hd_map_path) if f.endswith(".png")],
+            [os.path.join(hd_map_path, f) for f in os.listdir(hd_map_path) if f.endswith(".png")],
             key=extract_number
         )
-
+        
         if not hd_map_files:
             logger.warning(f"No HD Map files found in directory: {hd_map_path}")
             return None
@@ -355,7 +407,7 @@ class camDataLoader(Dataset):
         hd_map_images = []
         for idx in frame_indices:
             if idx < len(hd_map_files):
-                file_path = os.path.join(hd_map_path, hd_map_files[idx])
+                file_path = hd_map_files[idx]
                 logger.debug(f"Loading HD Map file: {file_path}")
                 hd_map_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
                 if hd_map_image is None:
@@ -364,29 +416,30 @@ class camDataLoader(Dataset):
                 hd_map_image = cv2.resize(hd_map_image, self.map_size)
                 hd_map_images.append(hd_map_image)
             else:
-                logger.warning(f"Frame index {idx} exceeds number of HD Map files in {hd_map_path}")
+                logger.warning(f"Frame index {idx} exceeds available HD Map files")
         return np.array(hd_map_images)
 
     def _load_gt_hd_map(self, scenario_path, frame_indices):
         """
         GT_HD_MAP 폴더에서 BEV segmentation GT용 HD Map 이미지를 불러오고,
-        카메라 이미지의 frame index에 맞춰 동기화합니다.
+        정렬된 순서(오름차순)로 frame_indices에 따라 로드합니다.
+        Args:
+            scenario_path (str): 현재 시나리오 디렉토리.
+            frame_indices (list[int]): 카메라 프레임 인덱스 리스트.
         """
         gt_hd_map_path = os.path.join(scenario_path, self.gt_hd_map_dir)
-
         if not os.path.exists(gt_hd_map_path):
             logger.warning(f"GT HD Map directory not found: {gt_hd_map_path}")
             return None
 
         def extract_number(file_name):
-            match = re.search(r'(\d+)', file_name)
-            return int(match.group(1)) if match else float('inf')
+            m = re.search(r'EGO_(\d+)', file_name)
+            return int(m.group(1)) if m else float('inf')
 
         gt_hd_map_files = sorted(
             [f for f in os.listdir(gt_hd_map_path) if f.endswith(".png")],
             key=extract_number
         )
-
         if not gt_hd_map_files:
             logger.warning(f"No GT HD Map files found in directory: {gt_hd_map_path}")
             return None
@@ -407,10 +460,7 @@ class camDataLoader(Dataset):
         return np.array(gt_hd_map_images)
 
     def _process_gt_hd_map(self, gt_hd_map_frame):
-        """
-        GT_HD_MAP 프레임을 BEV segmentation GT용으로 전처리합니다.
-        여기서는 HD Map과 동일한 방식으로 다중 채널 바이너리 마스크를 생성합니다.
-        """
+        """GT_HD_MAP 프레임을 BEV segmentation GT용으로 전처리."""
         exterior = (gt_hd_map_frame[:, :, 0] > 200).astype(np.float32)
         interior = (gt_hd_map_frame[:, :, 1] > 200).astype(np.float32)
         lane = (gt_hd_map_frame[:, :, 2] > 200).astype(np.float32)

@@ -5,7 +5,7 @@ from models.encoder import Encoder, HDMapFeaturePipeline, FeatureEmbedding, Traf
 from models.decoder import TrafficSignClassificationHead, EgoStateHead, Decoder
 from models.GRU import BEVGRU, EgoStateGRU 
 from models.backbones.efficientnet import EfficientNetExtractor
-from models.control import FutureControlMLP
+from models.control import FutureControlMLP, ControlMLP
 from utils.attention import FeatureFusionAttention
 from dataloader.dataloader import camDataLoader
 
@@ -32,7 +32,7 @@ class EndToEndModel(nn.Module):
         bev_offset = config.get("bev_offset", 0)
         decoder_blocks = config.get("decoder_blocks", [128, 128, 64])
 
-        # Backbone 초기화 (EfficientNetExtractor)
+        # Backbone 초기화 (EfficientNetExtractor) / 1634MB
         self.backbone = EfficientNetExtractor(
             model_name="efficientnet-b4",
             layer_names=["reduction_2", "reduction_4"],
@@ -40,7 +40,6 @@ class EndToEndModel(nn.Module):
             image_width=image_w,
         )
         
-        # CrossViewAttention 관련 설정 (Encoder 내부에서 사용됨)
         cross_view_config = {
             "heads": 4,
             "dim_head": 32,
@@ -62,7 +61,7 @@ class EndToEndModel(nn.Module):
             "decoder_blocks": decoder_blocks,
         }
         
-        # Encoder 초기화
+        # Encoder 초기화 / 1636MB(+2MB)
         self.encoder = Encoder(
             backbone=self.backbone,
             cross_view=cross_view_config,
@@ -72,7 +71,7 @@ class EndToEndModel(nn.Module):
             middle=[2, 2],
         )
         
-        # BEV GRU 모델 초기화
+        # BEV GRU 모델 초기화 / 1980MB(+344MB)
         # 입력 채널 수: 256 (hd map feature 128 + encoder output 128)
         # 출력 채널 수: 128
         input_dim = 256
@@ -81,29 +80,29 @@ class EndToEndModel(nn.Module):
         height, width = 18, 18
         self.bev_gru = BEVGRU(input_dim, hidden_dim, output_dim, height, width)
         
-        # Ego GRU 모델 및 Feature Embedding 초기화
+        # # Ego GRU 모델 및 Feature Embedding 초기화 / 1980MB(+0MB)
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
         self.ego_gru = EgoStateGRU(input_dim=112, hidden_dim=256, output_dim=128, num_layers=1)
         
-        # HD Map Feature Pipeline 초기화
+        # HD Map Feature Pipeline 초기화 / 2076MB(+96MB)
         self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=6, final_channels=128, final_size=(18, 18))
         
-        # Front-view (Traffic) Encoder 초기화
+        # Front-view (Traffic) Encoder 초기화 / 2176MB(+100MB)
         self.traffic_encoder = TrafficLightEncoder(feature_dim=128, pretrained=True)
         
-        # Feature Fusion Attention 초기화
-        self.fusion_model = FeatureFusionAttention(feature_dim=128, bev_dim=128, time_steps=2, spatial_dim=32)
+        # # Feature Fusion Attention 초기화
+        # self.fusion_model = FeatureFusionAttention(feature_dim=128, bev_dim=128, time_steps=2, spatial_dim=32)
         
-        # Traffic Sign Classification Head 초기화
+        # Traffic Sign Classification Head 초기화 / 2176MB(+0MB)
         self.classification_head = TrafficSignClassificationHead(input_dim=128, num_classes=10)
         
-        # Future Control Head (MLP) 초기화
-        self.control_mlp = FutureControlMLP(seq_len=2, input_dim=128, hidden_dim=64, output_dim=3)
+        # Future Control Head (MLP) 초기화 / 2176MB(+0MB)
+        self.control = ControlMLP(future_steps=2, control_dim=3)
         
-        # Future Ego Head 초기화
+        # Future Ego Head 초기화 / 2176MB(+0MB)
         self.ego_header = EgoStateHead(input_dim=128, hidden_dim=64, output_dim=21)
         
-        # BEV decoder 초기화
+        # BEV decoder 초기화 / 2176MB(+0MB)
         self.bev_decoder = Decoder(dim=128, blocks=decoder_blocks, residual=True, factor=2)
     
     def forward(self, batch):
@@ -148,16 +147,12 @@ class EndToEndModel(nn.Module):
         front_feature = self.traffic_encoder(batch["image"])  
         # front_feature shape: [B, 128]
 
-        # Feature Fusion Attention: front, BEV, Ego 정보를 융합
-        fusion_output = self.fusion_model(front_feature, gru_bev, ego_gru_output)  
-        # fusion_output shape: [B, future_steps, 128]
-
         # Traffic Sign Classification Head (front feature 사용)
         classification_output = self.classification_head(front_feature)  
         # classification_output shape: [B, num_classes]
 
         # Future Control 예측 (fusion된 feature 사용)
-        control_output = self.control_mlp(fusion_output)  
+        control_output = self.control(front_feature, gru_bev, ego_gru_output)
         # control_output shape: [B, 3]
 
         return {
@@ -196,9 +191,9 @@ def main():
     
     # End-to-End 모델 초기화
     model = EndToEndModel(config).to(device)
-    
+
     # 데이터 로더 초기화 (root_dir 경로는 실제 데이터셋 경로로 수정)
-    root_dir = "/home/vip1/hd/2025_HMG_AD/v2/Dataset_sample"
+    root_dir = "/home/vip/hd/Dataset"
     dataloader = get_dataloader(root_dir, num_timesteps=3, batch_size=1)
     
     # 배치 단위로 forward pass 수행
@@ -224,7 +219,6 @@ def main():
             bev_seg = outputs["bev_seg"]                            # [B, T, 6, 144, 144]
             traffic = outputs["classification"]                     # [B, C]
             control = outputs["control"]                            # [B, 3]           
-            
             print(f"Batch {batch_idx}: control shape = {control.shape}, classification shape = {traffic.shape}")
 
 if __name__ == "__main__":

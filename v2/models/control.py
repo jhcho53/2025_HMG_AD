@@ -37,3 +37,53 @@ class FutureControlMLP(nn.Module):
         future_control_value = self.fc2(x)  # [batch_size, output_dim]
 
         return future_control_value
+
+
+class ControlMLP(nn.Module):
+    def __init__(self, future_steps, control_dim=3, hidden_dim=256):
+        """
+        Args:
+            future_steps (int): 미래 예측 단계 수.
+            control_dim (int): 출력 제어값의 차원 (예: 스티어링, 가속도, 브레이크 등).
+            hidden_dim (int): MLP 내부 은닉층 차원.
+        """
+        super(ControlMLP, self).__init__()
+        # gru_bev의 spatial feature를 flatten한 크기: 128 * 18 * 18
+        self.gru_bev_fc = nn.Linear(128 * 18 * 18, 128)
+        
+        # 결합된 feature: front_feature (128) + ego_gru_output (128) + gru_bev (128) = 384
+        self.mlp = nn.Sequential(
+            nn.Linear(128 * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, control_dim)
+        )
+    
+    def forward(self, front_feature, gru_bev, ego_gru_output):
+        """
+        Args:
+            front_feature: Tensor, shape [B, 128]
+            gru_bev: Tensor, shape [B, future_steps, 128, 18, 18]
+            ego_gru_output: Tensor, shape [B, future_steps, 128]
+        
+        Returns:
+            control: Tensor, shape [B, future_steps, control_dim]
+        """
+        B, T, C, H, W = gru_bev.shape
+        
+        # 1. gru_bev 처리: flatten spatial dimension 후 선형 계층 적용
+        gru_bev_flat = gru_bev.view(B, T, -1)  # shape: [B, T, 128*18*18]
+        gru_bev_feat = self.gru_bev_fc(gru_bev_flat)  # shape: [B, T, 128]
+        
+        # 2. front_feature 확장: [B, 128] -> [B, T, 128]
+        front_feature_exp = front_feature.unsqueeze(1).expand(B, T, -1)
+        
+        # 3. 세 feature를 concat: [B, T, 128*3]
+        combined_features = torch.cat([front_feature_exp, ego_gru_output, gru_bev_feat], dim=-1)
+        
+        # 4. MLP 적용: 우선 (B*T, 384)로 reshape
+        combined_flat = combined_features.view(B * T, -1)
+        control_flat = self.mlp(combined_flat)  # shape: [B*T, control_dim]
+        
+        # 5. 다시 (B, T, control_dim)으로 reshape하여 출력
+        control = control_flat.view(B, T, -1)
+        return control

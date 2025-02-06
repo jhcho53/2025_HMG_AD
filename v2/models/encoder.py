@@ -151,7 +151,7 @@ class FeatureEmbedding(nn.Module):
 class TrafficLightEncoder(nn.Module):
     def __init__(self, feature_dim=128, pretrained=True):
         super(TrafficLightEncoder, self).__init__()
-        self.backbone = models.resnet50(weights='IMAGENET1K_V1' if pretrained else None)
+        self.backbone = models.resnet50(pretrained=pretrained)
         num_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Identity()  # Remove final classification layer
         self.fc = nn.Linear(num_features, feature_dim)
