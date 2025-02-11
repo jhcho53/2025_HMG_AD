@@ -105,3 +105,83 @@ class BEVEmbedding(nn.Module):
 
     def get_prior(self):
         return self.learned_features
+    
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, mid_channels, out_channels, dropout_rate=0.3):
+        super(ConvBlock, self).__init__()
+        self.conv3x3_1 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.conv1x1 = nn.Conv2d(mid_channels, mid_channels, kernel_size=1)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        self.conv3x3_2 = nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout2d(p=dropout_rate)
+    
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv3x3_1(x)))
+        x = self.dropout(x)
+        x = self.relu(self.bn2(self.conv1x1(x)))
+        x = self.dropout(x)
+        x = self.relu(self.bn3(self.conv3x3_2(x)))
+        return x
+
+
+class BEV_Ego_Fusion(nn.Module):
+    """
+    BEV feature와 Ego feature를 각각 입력받아,
+    BEV는 Conv+Flatten+Linear로 [B,T, bev_dim]으로 변환하고,
+    Ego와 concat([B,T, bev_dim + ego_dim])한 결과를 반환.
+    """
+    def __init__(
+        self,
+        bev_in_channels=128,  # BEV feature의 입력 채널
+        bev_mid_channels=64,
+        bev_out_channels=128,
+        bev_dim=112,          # BEV를 최종적으로 flatten+linear 했을 때의 차원
+        ego_dim=112,          # ego feature의 차원
+        H=18, W=18            # BEV feature의 공간 크기
+    ):
+        super(BEV_Ego_Fusion, self).__init__()
+        
+        # 1) BEV feature를 위한 conv 블록
+        self.conv_block = ConvBlock(bev_in_channels, bev_mid_channels, bev_out_channels)
+        
+        # 2) Conv 블록의 출력 shape: [B*T, bev_out_channels, H, W]
+        #    flatten할 차원 = bev_out_channels * H * W
+        self.flatten_dim = bev_out_channels * H * W
+        
+        # 3) flatten 후 원하는 차원(bev_dim)으로 줄이기 위한 FC
+        self.fc = nn.Linear(self.flatten_dim, bev_dim)
+        
+        # 4) ego_dim은 그대로 사용. (별도의 처리 없이 concat)
+        self.ego_dim = ego_dim
+        self.bev_dim = bev_dim
+
+    def forward(self, bev_feature, ego_feature):
+        """
+        Args:
+            bev_feature: [B, T, bev_in_channels, H, W]
+            ego_feature: [B, T, ego_dim]
+        Returns:
+            concat_vector: [B, T, bev_dim + ego_dim]
+        """
+        B, T, C, H, W = bev_feature.shape
+        
+        # (A) BEV feature 처리
+        # 시간 차원(T)을 배치 차원에 합침: [B*T, C, H, W]
+        x = bev_feature.view(B * T, C, H, W)
+        # Conv block
+        x = self.conv_block(x)  # [B*T, bev_out_channels, H, W]
+        # Flatten
+        x = x.reshape(B * T, -1)   # [B*T, flatten_dim]
+        # Linear로 bev_dim으로 매핑
+        bev_vec = self.fc(x)    # [B*T, bev_dim]
+        # 다시 (B, T) 형태로 복원
+        bev_vec = bev_vec.view(B, T, self.bev_dim)  # [B, T, bev_dim]
+        
+        # Concatenate
+        concat_vector = torch.cat([bev_vec, ego_feature], dim=-1)  # [B, T, bev_dim + ego_dim]
+        
+        return concat_vector
+

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class BEVGRU(nn.Module):
-    def __init__(self, input_channels, hidden_dim, output_dim, height, width):
+    def __init__(self, input_channels, hidden_dim, output_dim, height, width, dropout_prob=0.5):
         super(BEVGRU, self).__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
@@ -12,15 +12,22 @@ class BEVGRU(nn.Module):
         # CNN을 사용하여 feature dimension을 hidden_dim으로 변환
         self.feature_extractor = nn.Sequential(
         nn.Conv2d(input_channels, hidden_dim // 2, kernel_size=3, stride=1, padding=1),
+        nn.BatchNorm2d(hidden_dim // 2),
         nn.ReLU(),
+        nn.Dropout2d(p=dropout_prob),
+
         nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, stride=1, padding=1),
+        nn.BatchNorm2d(hidden_dim),
         nn.ReLU(),
+        nn.Dropout2d(p=dropout_prob),
         nn.AdaptiveAvgPool2d((1, 1)),  # [batch*seq_len, hidden_dim, 1, 1]
         nn.Flatten()  # [batch*seq_len, hidden_dim]
     )
 
         # GRU Layer
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+
+        self.dropout = nn.Dropout(p=dropout_prob)
 
         # Fully Connected Layer to project GRU output
         self.fc = nn.Linear(hidden_dim, output_dim * height * width)
@@ -42,7 +49,10 @@ class BEVGRU(nn.Module):
 
         for _ in range(future_steps):
             last_hidden, _ = self.gru(last_hidden)  # [batch, 1, hidden_dim]
-            future_pred.append(self.fc(last_hidden).view(batch_size, 1, -1, self.height, self.width))
+            last_hidden = self.dropout(last_hidden)
+            fc_out = self.fc(last_hidden)  # [batch, 1, output_dim*height*width]
+            fc_out = fc_out.view(batch_size, 1, self.output_dim, self.height, self.width)
+            future_pred.append(fc_out)
 
         future_pred = torch.cat(future_pred, dim=1)  # [batch, future_steps, output_dim, height, width]
 
@@ -60,7 +70,7 @@ class BEVGRU(nn.Module):
         return total_output, future_bev
     
 class EgoStateGRU(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1, dropout_prob=0.5):
         """
         Args:
             input_dim (int): Input feature dimension (e.g., 112 for ego state embedding).
@@ -75,6 +85,8 @@ class EgoStateGRU(nn.Module):
 
         # GRU Layer
         self.gru = nn.GRU(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+
+        self.dropout = nn.Dropout(dropout_prob)
 
         # Fully Connected Layer to project to desired output dimension
         self.fc = nn.Linear(hidden_dim, output_dim)
@@ -105,8 +117,10 @@ class EgoStateGRU(nn.Module):
         for _ in range(future_steps):
             # 🔹 GRU로 future step 예측
             next_out, hidden_state = self.gru(future_input, hidden_state)
+            next_out = self.dropout(next_out)
             next_output = self.fc(next_out.squeeze(1))  # [batch_size, output_dim]
-
+            next_output = self.dropout(next_output)
+            
             # 🔹 Append prediction
             future_pred.append(next_output.unsqueeze(1))  # [batch_size, 1, output_dim]
 

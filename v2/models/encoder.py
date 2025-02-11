@@ -6,6 +6,7 @@ from einops import rearrange, repeat
 from torchvision.models.resnet import Bottleneck
 from torchvision import models
 from torchvision.models import resnet50
+from torchvision.models import ResNet50_Weights
 from typing import List
 from utils.attention import CrossAttention, CrossViewAttention
 from utils.utils import generate_grid, get_view_matrix, Normalize, RandomCos, BEVEmbedding
@@ -93,7 +94,10 @@ class EmbeddingMLP(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim)
         )
     
     def forward(self, x):
@@ -110,7 +114,7 @@ class FeatureEmbedding(nn.Module):
         self.angular_velocity_mlp = EmbeddingMLP(input_dim=3, hidden_dim=hidden_dim, output_dim=output_dim)
         self.acceleration_mlp = EmbeddingMLP(input_dim=3, hidden_dim=hidden_dim, output_dim=output_dim)
         self.scalar_mlp = EmbeddingMLP(input_dim=3, hidden_dim=hidden_dim, output_dim=output_dim)  # accel, brake, steer
-        
+    
     def forward(self, data):
 
         batch_size, time_steps, _ = data.shape
@@ -151,9 +155,10 @@ class FeatureEmbedding(nn.Module):
 class TrafficLightEncoder(nn.Module):
     def __init__(self, feature_dim=128, pretrained=True):
         super(TrafficLightEncoder, self).__init__()
-        self.backbone = models.resnet50(pretrained=pretrained)
+        self.backbone = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
         num_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Identity()  # Remove final classification layer
+        self.dropout = nn.Dropout(p=0.5)
         self.fc = nn.Linear(num_features, feature_dim)
 
     def forward(self, x):
@@ -164,7 +169,7 @@ class TrafficLightEncoder(nn.Module):
         features = self.backbone(current_time_frame)  # Shape: [batch, num_features]
 
         # Reduce dimensionality
-        features = self.fc(features)  # Shape: [batch, feature_dim]
+        features = self.dropout(self.fc(features))  # Shape: [batch, feature_dim]
 
         return features
 
@@ -174,7 +179,7 @@ class ResNetFeatureExtractor(nn.Module):
     """
     def __init__(self, input_channels=6, output_channels=2048):
         super(ResNetFeatureExtractor, self).__init__()
-        resnet = resnet50(pretrained=True)
+        resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
         # 첫 번째 Conv 레이어 수정
         resnet.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])  # ResNet Feature Extractor

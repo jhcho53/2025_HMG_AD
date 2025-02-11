@@ -84,7 +84,7 @@ class EfficientNetExtractor(torch.nn.Module):
 
         for layer in self.layers:
             if self.training:
-                x = torch.utils.checkpoint.checkpoint(layer, x)
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
             else:
                 x = layer(x)
 

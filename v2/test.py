@@ -7,6 +7,7 @@ from models.GRU import BEVGRU, EgoStateGRU
 from models.backbones.efficientnet import EfficientNetExtractor
 from models.control import FutureControlMLP, ControlMLP
 from utils.attention import FeatureFusionAttention
+from utils.utils import BEV_Ego_Fusion
 from dataloader.dataloader import camDataLoader
 
 
@@ -82,8 +83,11 @@ class EndToEndModel(nn.Module):
         
         # # Ego GRU 모델 및 Feature Embedding 초기화 / 1980MB(+0MB)
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
-        self.ego_gru = EgoStateGRU(input_dim=112, hidden_dim=256, output_dim=128, num_layers=1)
+        self.ego_gru = EgoStateGRU(input_dim=224, hidden_dim=256, output_dim=128, num_layers=1)
         
+        # Ego + BEV Fusion 
+        self.ego_fusion = BEV_Ego_Fusion()
+
         # HD Map Feature Pipeline 초기화 / 2076MB(+96MB)
         self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=6, final_channels=128, final_size=(18, 18))
         
@@ -120,17 +124,22 @@ class EndToEndModel(nn.Module):
 
         # Ego Encoding
         ego_embedding = self.feature_embedding(batch["ego_info"])  
-        # ego_embedding shape: [B, seq_len, 112] (예시)
-        ego_gru_output = self.ego_gru(ego_embedding)  
+        # ego_embedding shape: [B, seq_len, 112]
+
+        # BEV Encoding
+        bev_output = self.encoder(batch)  
+        # bev_output shape: [B, time_steps, 128, 18, 18]
+
+        # fusion ego + bev
+        fusion_ego = self.ego_fusion(bev_output, ego_embedding)
+        # fusion_ego shape = [B, time_steps, 224]
+
+        ego_gru_output = self.ego_gru(fusion_ego)  
         # ego_gru_output shape: [B, future_steps, 128]
         
         # Ego decoding
         future_ego = self.ego_header(ego_gru_output)
         # future_ego shape = [B, future_steps, 21]
-        
-        # BEV Encoding
-        bev_output = self.encoder(batch)  
-        # bev_output shape: [B, time_steps, 128, 18, 18]
         
         # BEV Decoding
         bev_decoding = self.bev_decoder(bev_output)
@@ -139,6 +148,7 @@ class EndToEndModel(nn.Module):
         # HD map feature와 BEV feature를 채널 차원에서 concat (256 채널)
         concat_bev = torch.cat([hd_features, bev_output], dim=2)  
         # concat_bev shape: [B, time_steps, 256, 18, 18]
+        
         # GRU를 통해 과거, 현재, 미래 정보를 추출 (여기서는 미래 정보만 사용)
         _, gru_bev = self.bev_gru(concat_bev)  
         # gru_bev shape: [B, future_steps, 128, 18, 18]
@@ -193,7 +203,7 @@ def main():
     model = EndToEndModel(config).to(device)
 
     # 데이터 로더 초기화 (root_dir 경로는 실제 데이터셋 경로로 수정)
-    root_dir = "/home/vip/hd/Dataset"
+    root_dir = "/home/jaehyeon/Desktop/VIPLAB/2025_HMG_AD/v2/Dataset_sample"
     dataloader = get_dataloader(root_dir, num_timesteps=3, batch_size=1)
     
     # 배치 단위로 forward pass 수행
