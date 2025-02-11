@@ -9,10 +9,10 @@ import matplotlib.cm as cm
 # -------------------------
 # (1) 고정된 맵 관련 데이터 로드
 # -------------------------
-road_mesh_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PG_KATRI/road_mesh_out_line_polygon_set.json'
-lane_boundary_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PG_KATRI/lane_boundary_set.json'
-crosswalk_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PG_KATRI/singlecrosswalk_set.json'
-traffic_light_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PG_KATRI/traffic_light_set.json'
+road_mesh_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/road_mesh_out_line_polygon_set.json'
+lane_boundary_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/lane_boundary_set.json'
+crosswalk_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/singlecrosswalk_set.json'
+traffic_light_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/traffic_light_set.json'
 
 with open(road_mesh_file, 'r') as file:
     road_mesh_data = json.load(file)
@@ -225,8 +225,8 @@ traffic_light_colors = assign_colors(traffic_light_points_by_subtype.keys())
 # -------------------------
 # (7) 시나리오별 처리
 # -------------------------
-for scenario_idx in range(0, 251):
-    scenario_dir = f'/home/vip/hd_jh/v2/Dataset_sample/R_KR_PG_KATRI__HMG_Scenario_{scenario_idx}'
+for scenario_idx in range(254, 373):
+    scenario_dir = f'/home/vip/hd/Dataset/R_KR_PR_Sangam_DP__HMG_Scenario_{scenario_idx}'
     
     if not os.path.isdir(scenario_dir):
         continue

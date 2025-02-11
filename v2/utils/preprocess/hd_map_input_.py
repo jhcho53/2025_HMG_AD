@@ -9,10 +9,10 @@ import matplotlib.cm as cm
 # -------------------------
 # (1) 고정된 맵 관련 데이터 로드
 # -------------------------
-road_mesh_file = '/home/jaehyeon/Desktop/VIPLAB/HD_E2E/Map_Data/R_KR_PG_KATRI/road_mesh_out_line_polygon_set.json'
-lane_boundary_file = '/home/jaehyeon/Desktop/VIPLAB/HD_E2E/Map_Data/R_KR_PG_KATRI/lane_boundary_set.json'
-crosswalk_file = '/home/jaehyeon/Desktop/VIPLAB/HD_E2E/Map_Data/R_KR_PG_KATRI/singlecrosswalk_set.json'
-traffic_light_file = '/home/jaehyeon/Desktop/VIPLAB/HD_E2E/Map_Data/R_KR_PG_KATRI/traffic_light_set.json'
+road_mesh_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/road_mesh_out_line_polygon_set.json'
+lane_boundary_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/lane_boundary_set.json'
+crosswalk_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/singlecrosswalk_set.json'
+traffic_light_file = '/home/vip/hd/Dataset_sample/Map_Data/R_KR_PR_Sangam_DP/traffic_light_set.json'
 
 with open(road_mesh_file, 'r') as file:
     road_mesh_data = json.load(file)
@@ -197,8 +197,8 @@ interior_colors = assign_colors(classified_interior_points.keys())
 # (6) 시나리오를 순회하며 작업
 # -------------------------
 # 예: R_KR_PG_KATRI__HMG_Scenario_0, R_KR_PG_KATRI__HMG_Scenario_1, ...
-for scenario_idx in range(0, 50):
-    scenario_dir = f'/home/jaehyeon/Desktop/VIPLAB/HD_E2E/R_KR_PG_KATRI__HMG_Scenario_{scenario_idx}'
+for scenario_idx in range(254, 373):
+    scenario_dir = f'/home/vip/hd/Dataset/R_KR_PR_Sangam_DP__HMG_Scenario_{scenario_idx}'
     
     # 해당 시나리오 폴더가 존재하지 않으면 스킵
     if not os.path.isdir(scenario_dir):

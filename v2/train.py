@@ -161,10 +161,10 @@ class EndToEndModel(nn.Module):
         }
 
 
-def get_dataloader(dataset, batch_size=3, sampler=None):
+def get_dataloader(dataset, batch_size=12, sampler=None):
     """
     데이터셋과 DataLoader 초기화 함수.
-    DistributedSampler가 제공되면 이를 사용합니다.
+    DistributedSampler가 제공되면 이를 사용.
     """
     dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=False)
     return dataloader
@@ -227,14 +227,14 @@ def train(local_rank, args, distributed=False):
             dataset=dataset,
             num_replicas=world_size,
             rank=rank,
-            shuffle=False
+            shuffle=True
         )
-        dataloader = get_dataloader(dataset, batch_size=3, sampler=sampler)
+        dataloader = get_dataloader(dataset, batch_size=12, sampler=sampler)
     else:
         sampler = None
-        dataloader = get_dataloader(dataset, batch_size=3, sampler=None)
+        dataloader = get_dataloader(dataset, batch_size=12, sampler=None)
     
-    num_epochs = 10
+    num_epochs = 2
     model.train()
     
     for epoch in range(num_epochs):
@@ -245,7 +245,7 @@ def train(local_rank, args, distributed=False):
         for batch_idx, data in enumerate(dataloader):
             if data is None:  # None 데이터가 전달되었는지 확인
                 print(f"Warning: Skipping batch {batch_idx} due to empty data.")
-                break  # 배치가 None이면 건너뛴다.
+                break  # 배치가 None이면 skip.
 
             # 데이터의 각 항목을 device로 이동
             batch = {
