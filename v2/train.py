@@ -161,7 +161,7 @@ class EndToEndModel(nn.Module):
         }
 
 
-def get_dataloader(dataset, batch_size=12, sampler=None):
+def get_dataloader(dataset, batch_size=16, sampler=None):
     """
     데이터셋과 DataLoader 초기화 함수.
     DistributedSampler가 제공되면 이를 사용.
@@ -229,12 +229,12 @@ def train(local_rank, args, distributed=False):
             rank=rank,
             shuffle=True
         )
-        dataloader = get_dataloader(dataset, batch_size=12, sampler=sampler)
+        dataloader = get_dataloader(dataset, batch_size=16, sampler=sampler)
     else:
         sampler = None
-        dataloader = get_dataloader(dataset, batch_size=12, sampler=None)
+        dataloader = get_dataloader(dataset, batch_size=16, sampler=None)
     
-    num_epochs = 2
+    num_epochs = 1
     model.train()
     
     for epoch in range(num_epochs):
@@ -249,13 +249,13 @@ def train(local_rank, args, distributed=False):
 
             # 데이터의 각 항목을 device로 이동
             batch = {
-                "image": data["images_input"].to(device),           # [B, num_views, C, H, W]
+                "image": data["images_input"].to(device),           # [B, T, num_views, C, H, W]
                 "intrinsics": data["intrinsic_input"].to(device),     # [B, num_views, 3, 3]
                 "extrinsics": data["extrinsic_input"].to(device),     # [B, num_views, 4, 4]
                 "hd_map": data["hd_map_input"].to(device),
                 "ego_info": data["ego_info"].to(device),
             }
-            
+
             # Ground Truth (GT)
             ego_info_future_gt = data["ego_info_future"].to(device)   # [B, future_steps, 21]
             bev_seg_gt = data["gt_hd_map_input"].to(device)            # [B, T, 6, 144, 144]

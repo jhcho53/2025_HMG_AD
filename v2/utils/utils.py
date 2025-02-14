@@ -140,7 +140,7 @@ class BEV_Ego_Fusion(nn.Module):
         bev_out_channels=128,
         bev_dim=112,          # BEV를 최종적으로 flatten+linear 했을 때의 차원
         ego_dim=112,          # ego feature의 차원
-        H=18, W=18            # BEV feature의 공간 크기
+        H=25, W=25            # BEV feature의 공간 크기
     ):
         super(BEV_Ego_Fusion, self).__init__()
         

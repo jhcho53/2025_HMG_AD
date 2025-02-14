@@ -40,8 +40,8 @@ def get_ego_frame(file_path):
 
 # -------------------------------------------------------------------
 class camDataLoader(Dataset):
-    def __init__(self, root_dir, num_timesteps=3, image_size=(135, 240), map_size=(144, 144), 
-                 hd_map_dir="HD_MAP", gt_hd_map_dir="GT_HD_MAP", ego_info_dir="EGO_INFO", 
+    def __init__(self, root_dir, num_timesteps=3, image_size=(270, 480), map_size=(200, 200), 
+                 hd_map_dir="HD_MAP", gt_hd_map_dir="GT_HD", ego_info_dir="EGO_INFO", 
                  traffic_info_dir="TRAFFIC_INFO", num_traffic_classes=10):
         """
         Args:
@@ -258,7 +258,7 @@ class camDataLoader(Dataset):
                         key, value = line.split(":", 1)
                         key = key.strip()
                         value = value.strip()
-                        if key in {"position", "orientation", "enu_velocity", "velocity", "angularVelocity", "acceleration"}:
+                        if key in {"position", "orientation", "velocity"}:
                             ego_info_dict[key] = list(map(float, value.split()))
                         elif key in {"accel", "brake", "steer"}:
                             if "control" not in ego_info_dict:
@@ -268,7 +268,7 @@ class camDataLoader(Dataset):
                             ego_info_dict["trafficlightid"] = value
             # flatten: 각 키에 대해 값이 없으면 기본값 [0.0, 0.0, 0.0] 사용
             ego_info_values = []
-            for k in ["position", "orientation", "enu_velocity", "velocity", "angularVelocity", "acceleration", "control"]:
+            for k in ["position", "orientation", "velocity", "control"]:
                 default_length = 3
                 ego_info_values.extend(ego_info_dict.get(k, [0.0] * default_length))
             ego_info_data.append(ego_info_values)
@@ -350,7 +350,6 @@ class camDataLoader(Dataset):
             gt_hd_map_images = torch.tensor(gt_hd_map_images, dtype=torch.float32)
             gt_hd_map_input = gt_hd_map_images[:self.num_timesteps]
             gt_hd_map_future = gt_hd_map_images[self.num_timesteps:]
-
         return {
             "images_input": images_input,         # (num_timesteps, num_cameras, C, H, W)
             "images_future": images_future,         # (future_steps, num_cameras, C, H, W)
@@ -371,13 +370,27 @@ class camDataLoader(Dataset):
 
     def _process_hd_map(self, hd_map_frame):
         """HD Map 프레임을 다중 채널 텐서로 전처리."""
-        exterior = (hd_map_frame[:, :, 0] > 200).astype(np.float32)
-        interior = (hd_map_frame[:, :, 1] > 200).astype(np.float32)
-        lane = (hd_map_frame[:, :, 2] > 200).astype(np.float32)
-        crosswalk = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 1] > 200)).astype(np.float32)
-        traffic_light = ((hd_map_frame[:, :, 1] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)
-        ego_vehicle = ((hd_map_frame[:, :, 0] > 200) & (hd_map_frame[:, :, 2] > 200)).astype(np.float32)
-        return np.stack([exterior, interior, lane, crosswalk, traffic_light, ego_vehicle], axis=0)
+        ego_color = np.array([0, 0, 255])
+        global_path_color = np.array([255, 0, 0])
+        drivable_area_color = np.array([200, 200, 200])
+        white_lane_color = np.array([255, 255, 255])
+        yellow_lane_color = np.array([0, 255, 255])
+        crosswalk_color = np.array([0, 255, 0])
+        traffic_light_color = np.array([0, 0, 255])
+        
+        # 각 채널의 픽셀값이 해당 색상과 정확히 일치하는지 확인
+        ego_mask = np.all(hd_map_frame == ego_color, axis=-1).astype(np.float32)
+        global_path_mask = np.all(hd_map_frame == global_path_color, axis=-1).astype(np.float32)
+        drivable_area_mask = np.all(hd_map_frame == drivable_area_color, axis=-1).astype(np.float32)
+        white_lane_mask = np.all(hd_map_frame == white_lane_color, axis=-1).astype(np.float32)
+        yellow_lane_mask = np.all(hd_map_frame == yellow_lane_color, axis=-1).astype(np.float32)
+        crosswalk_mask = np.all(hd_map_frame == crosswalk_color, axis=-1).astype(np.float32)
+        traffic_light_mask = np.all(hd_map_frame == traffic_light_color, axis=-1).astype(np.float32)
+        
+        # 7채널 텐서로 스택 (채널 순서: ego, global path, drivable area, white lane, yellow lane, crosswalk, traffic light)
+        return np.stack([ego_mask, global_path_mask, drivable_area_mask,
+                        white_lane_mask, yellow_lane_mask, crosswalk_mask,
+                        traffic_light_mask], axis=0)
 
     def _load_hd_map(self, scenario_path, frame_indices):
         """
@@ -392,14 +405,14 @@ class camDataLoader(Dataset):
             return None
 
         def extract_number(file_name):
-            m = re.search(r'EGO_(\d+)', file_name)
+            m = re.search(r'hd_map_(\d+)', file_name)
             return int(m.group(1)) if m else float('inf')
 
         hd_map_files = sorted(
             [os.path.join(hd_map_path, f) for f in os.listdir(hd_map_path) if f.endswith(".png")],
             key=extract_number
         )
-        
+
         if not hd_map_files:
             logger.warning(f"No HD Map files found in directory: {hd_map_path}")
             return None
@@ -433,7 +446,7 @@ class camDataLoader(Dataset):
             return None
 
         def extract_number(file_name):
-            m = re.search(r'EGO_(\d+)', file_name)
+            m = re.search(r'gt_hd_(\d+)', file_name)
             return int(m.group(1)) if m else float('inf')
 
         gt_hd_map_files = sorted(
@@ -459,12 +472,28 @@ class camDataLoader(Dataset):
                 logger.warning(f"Frame index {idx} exceeds number of GT HD Map files in {gt_hd_map_path}")
         return np.array(gt_hd_map_images)
 
-    def _process_gt_hd_map(self, gt_hd_map_frame):
-        """GT_HD_MAP 프레임을 BEV segmentation GT용으로 전처리."""
-        exterior = (gt_hd_map_frame[:, :, 0] > 200).astype(np.float32)
-        interior = (gt_hd_map_frame[:, :, 1] > 200).astype(np.float32)
-        lane = (gt_hd_map_frame[:, :, 2] > 200).astype(np.float32)
-        crosswalk = ((gt_hd_map_frame[:, :, 0] > 200) & (gt_hd_map_frame[:, :, 1] > 200)).astype(np.float32)
-        traffic_light = ((gt_hd_map_frame[:, :, 1] > 200) & (gt_hd_map_frame[:, :, 2] > 200)).astype(np.float32)
-        ego_vehicle = ((gt_hd_map_frame[:, :, 0] > 200) & (gt_hd_map_frame[:, :, 2] > 200)).astype(np.float32)
-        return np.stack([exterior, interior, lane, crosswalk, traffic_light, ego_vehicle], axis=0)
+    def _process_gt_hd_map(self, hd_map_frame):
+        """HD Map 프레임을 다중 채널 텐서로 전처리."""
+        ego_color = np.array([0, 0, 255])
+        global_path_color = np.array([255, 0, 0])
+        drivable_area_color = np.array([200, 200, 200])
+        white_lane_color = np.array([255, 255, 255])
+        yellow_lane_color = np.array([0, 255, 255])
+        crosswalk_color = np.array([0, 255, 0])
+        traffic_light_color = np.array([0, 0, 255])
+        object_info_color = np.array([128, 0, 128])  # 추가된 Object Info 색상
+
+        # 각 채널의 픽셀값이 해당 색상과 정확히 일치하는지 확인
+        ego_mask = np.all(hd_map_frame == ego_color, axis=-1).astype(np.float32)
+        global_path_mask = np.all(hd_map_frame == global_path_color, axis=-1).astype(np.float32)
+        drivable_area_mask = np.all(hd_map_frame == drivable_area_color, axis=-1).astype(np.float32)
+        white_lane_mask = np.all(hd_map_frame == white_lane_color, axis=-1).astype(np.float32)
+        yellow_lane_mask = np.all(hd_map_frame == yellow_lane_color, axis=-1).astype(np.float32)
+        crosswalk_mask = np.all(hd_map_frame == crosswalk_color, axis=-1).astype(np.float32)
+        traffic_light_mask = np.all(hd_map_frame == traffic_light_color, axis=-1).astype(np.float32)
+        object_info_mask = np.all(hd_map_frame == object_info_color, axis=-1).astype(np.float32)  # 추가된 Object Info 마스크
+
+        # 8채널 텐서로 스택 (채널 순서: ego, global path, drivable area, white lane, yellow lane, crosswalk, traffic light, object_info)
+        return np.stack([ego_mask, global_path_mask, drivable_area_mask,
+                        white_lane_mask, yellow_lane_mask, crosswalk_mask,
+                        traffic_light_mask, object_info_mask], axis=0)

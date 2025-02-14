@@ -24,10 +24,10 @@ class EndToEndModel(nn.Module):
         """
         super(EndToEndModel, self).__init__()
         # 기본 설정
-        image_h = config.get("image_h", 135)
-        image_w = config.get("image_w", 240)
-        bev_h = config.get("bev_h", 150)
-        bev_w = config.get("bev_w", 150)
+        image_h = config.get("image_h", 270)
+        image_w = config.get("image_w", 480)
+        bev_h = config.get("bev_h", 200)
+        bev_w = config.get("bev_w", 200)
         bev_h_meters = config.get("bev_h_meters", 50)
         bev_w_meters = config.get("bev_w_meters", 50)
         bev_offset = config.get("bev_offset", 0)
@@ -78,18 +78,18 @@ class EndToEndModel(nn.Module):
         input_dim = 256
         hidden_dim = 256
         output_dim = 128
-        height, width = 18, 18
+        height, width = 25, 25
         self.bev_gru = BEVGRU(input_dim, hidden_dim, output_dim, height, width)
         
         # # Ego GRU 모델 및 Feature Embedding 초기화 / 1980MB(+0MB)
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
-        self.ego_gru = EgoStateGRU(input_dim=224, hidden_dim=256, output_dim=128, num_layers=1)
+        self.ego_gru = EgoStateGRU(input_dim=176, hidden_dim=256, output_dim=128, num_layers=1)
         
         # Ego + BEV Fusion 
         self.ego_fusion = BEV_Ego_Fusion()
 
         # HD Map Feature Pipeline 초기화 / 2076MB(+96MB)
-        self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=6, final_channels=128, final_size=(18, 18))
+        self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=7, final_channels=128, final_size=(25, 25))
         
         # Front-view (Traffic) Encoder 초기화 / 2176MB(+100MB)
         self.traffic_encoder = TrafficLightEncoder(feature_dim=128, pretrained=True)
@@ -124,11 +124,11 @@ class EndToEndModel(nn.Module):
 
         # Ego Encoding
         ego_embedding = self.feature_embedding(batch["ego_info"])  
-        # ego_embedding shape: [B, seq_len, 112]
+        # ego_embedding shape: [B, seq_len, 64]
 
         # BEV Encoding
         bev_output = self.encoder(batch)  
-        # bev_output shape: [B, time_steps, 128, 18, 18]
+        # bev_output shape: [B, time_steps, 128, 25, 25]
 
         # fusion ego + bev
         fusion_ego = self.ego_fusion(bev_output, ego_embedding)
@@ -143,8 +143,8 @@ class EndToEndModel(nn.Module):
         
         # BEV Decoding
         bev_decoding = self.bev_decoder(bev_output)
-        # bev_decoding shape: [B, time_steps, 64, 144, 144]
-        
+        # bev_decoding shape: [B, time_steps, 8, 200, 200]
+
         # HD map feature와 BEV feature를 채널 차원에서 concat (256 채널)
         concat_bev = torch.cat([hd_features, bev_output], dim=2)  
         # concat_bev shape: [B, time_steps, 256, 18, 18]
@@ -189,10 +189,10 @@ def main():
     
     # 모델 설정 값
     config = {
-        "image_h": 135,
-        "image_w": 240,
-        "bev_h": 150,
-        "bev_w": 150,
+        "image_h": 270,
+        "image_w": 480,
+        "bev_h": 200,
+        "bev_w": 200,
         "bev_h_meters": 50,
         "bev_w_meters": 50,
         "bev_offset": 0,
@@ -203,7 +203,7 @@ def main():
     model = EndToEndModel(config).to(device)
 
     # 데이터 로더 초기화 (root_dir 경로는 실제 데이터셋 경로로 수정)
-    root_dir = "/home/jaehyeon/Desktop/VIPLAB/2025_HMG_AD/v2/Dataset_sample"
+    root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample"
     dataloader = get_dataloader(root_dir, num_timesteps=3, batch_size=1)
     
     # 배치 단위로 forward pass 수행
@@ -218,17 +218,15 @@ def main():
                 "hd_map": data["hd_map_input"].to(device),
                 "ego_info": data["ego_info"].to(device),
             }
-            
             ego_info_future_gt = data["ego_info_future"].to(device) # [B, 2, 21]
-            bev_seg_gt = data["gt_hd_map_input"].to(device)         # [B, T, 6, 144, 144]
+            bev_seg_gt = data["gt_hd_map_input"].to(device)         # [B, T, 8, 144, 144]
             traffic_gt = data["traffic"].to(device)                 # [B, C]
             control_gt = data["control"].to(device)                 # [B, 3]
-            
             outputs = model(batch)
             future_ego = outputs["future_ego"]                      # [B, 2, 21]
-            bev_seg = outputs["bev_seg"]                            # [B, T, 6, 144, 144]
+            bev_seg = outputs["bev_seg"]                            # [B, T, 8, 144, 144]
             traffic = outputs["classification"]                     # [B, C]
-            control = outputs["control"]                            # [B, 3]           
+            control = outputs["control"]                            # [B, 3]       
             print(f"Batch {batch_idx}: control shape = {control.shape}, classification shape = {traffic.shape}")
 
 if __name__ == "__main__":

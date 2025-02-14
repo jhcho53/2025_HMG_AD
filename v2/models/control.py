@@ -49,7 +49,7 @@ class ControlMLP(nn.Module):
         """
         super(ControlMLP, self).__init__()
         # gru_bev의 spatial feature를 flatten한 크기: 128 * 18 * 18
-        self.gru_bev_fc = nn.Linear(128 * 18 * 18, 128)
+        self.gru_bev_fc = nn.Linear(128 * 25 * 25, 128)
         
         # 결합된 feature: front_feature (128) + ego_gru_output (128) + gru_bev (128) = 384
         self.mlp = nn.Sequential(
