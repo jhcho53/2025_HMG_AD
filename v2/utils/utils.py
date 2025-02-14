@@ -107,7 +107,7 @@ class BEVEmbedding(nn.Module):
         return self.learned_features
     
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels, mid_channels, out_channels, dropout_rate=0.3):
+    def __init__(self, in_channels, mid_channels, out_channels, dropout_rate=0.1):
         super(ConvBlock, self).__init__()
         self.conv3x3_1 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(mid_channels)

@@ -122,6 +122,7 @@ class camDataLoader(Dataset):
         self.ego_data = []       # 각 시나리오의 필터링된 EGO_INFO 파일 리스트
         self.traffic_data = []   # 각 시나리오의 필터링된 TRAFFIC_INFO 파일 리스트 (없으면 None)
         self.valid_indices = []  # 전체 데이터셋에서 (시나리오 idx, 시작 프레임 인덱스) 튜플 리스트
+        # self.front_data = []
 
         for scenario_dir in all_scenario_dirs:
             logger.debug(f"Processing scenario directory: {scenario_dir}")
@@ -134,7 +135,7 @@ class camDataLoader(Dataset):
                 logger.warning(f"No CAMERA_* folders found in {scenario_dir}. Skipping scenario.")
                 continue
             logger.debug(f"Found CAMERA directories: {camera_dirs}")
-
+        
             camera_files = []
             for camera_dir in camera_dirs:
                 if not os.path.isdir(camera_dir):
@@ -149,6 +150,7 @@ class camDataLoader(Dataset):
                     continue
                 logger.debug(f"Camera directory {camera_dir} has {len(files)} image files. Sample: {files[:2]}")
                 camera_files.append(files)
+
             if not camera_files:
                 continue
             # 모든 카메라가 동일한 프레임 수를 가지고 있는지 확인
@@ -208,6 +210,7 @@ class camDataLoader(Dataset):
             self.camera_data.append(camera_files)
             self.ego_data.append(filtered_ego_files)
             self.traffic_data.append(traffic_entry)
+            # self.front_data.append(front_view)
 
             # 해당 시나리오 내에서 각 valid 시작 인덱스를 전역 valid index에 등록
             # (각 튜플: (해당 valid 시나리오 내 인덱스, 시작 frame index))
@@ -230,7 +233,6 @@ class camDataLoader(Dataset):
         camera_files = self.camera_data[scenario_idx]
         ego_files = self.ego_data[scenario_idx]
         traffic_files = self.traffic_data[scenario_idx]  # None일 수도 있음
-
         temporal_images = []
         ego_info_data = []
         control_info_data = []
@@ -311,13 +313,18 @@ class camDataLoader(Dataset):
         ego_info_input = ego_info_tensor[:self.num_timesteps]
         ego_info_future = ego_info_tensor[self.num_timesteps:]
         control_info_tensor = torch.tensor(control_info_data, dtype=torch.float32)
-        control_info_future = control_info_tensor[self.num_timesteps:]
-
+        control_info_future = control_info_tensor[3,:]
+        
         # --- 이미지 데이터 (CAMERA) ---
         temporal_images = torch.stack(temporal_images, dim=1)  # (num_cameras, total_steps, C, H, W)
         temporal_images = temporal_images.permute(1, 0, 2, 3, 4)  # (total_steps, num_cameras, C, H, W)
         images_input = temporal_images[:self.num_timesteps]
         images_future = temporal_images[self.num_timesteps:]
+
+        first_camera_images = temporal_images[:, 0, :, :, :]  # Shape: (total_steps, C, H, W)
+        crop_x1, crop_y1, crop_x2, crop_y2 = 50, 50, 150, 150  # 원하는 크롭 좌표 지정
+        first_camera_cropped = first_camera_images[:, :, crop_y1:crop_y2, crop_x1:crop_x2]  # Shape: (total_steps, C, crop_H, crop_W)
+        # front_camera = first_camera_cropped[:self.num_timesteps] 
 
         # --- Calibration (intrinsic & extrinsic) ---
         intrinsic = torch.stack(self.intrinsic_data, dim=0).unsqueeze(1).repeat(1, self.total_steps, 1, 1)

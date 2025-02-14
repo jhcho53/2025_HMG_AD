@@ -17,7 +17,7 @@ class TrafficSignClassificationHead(nn.Module):
         return x
     
 class EgoStateHead(nn.Module):
-    def __init__(self, input_dim=128, hidden_dim=64, output_dim=21):
+    def __init__(self, input_dim=128, hidden_dim=64, output_dim=12):
         """
         GRU에서 나온 128차원 feature를 21차원의 미래 ego 상태 값으로 변환하는 MLP 헤더.
         """

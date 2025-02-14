@@ -77,13 +77,13 @@ class EndToEndModel(nn.Module):
         # 출력 채널 수: 128
         input_dim = 256
         hidden_dim = 256
-        output_dim = 128
+        output_dim = 256
         height, width = 25, 25
         self.bev_gru = BEVGRU(input_dim, hidden_dim, output_dim, height, width)
         
         # # Ego GRU 모델 및 Feature Embedding 초기화 / 1980MB(+0MB)
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
-        self.ego_gru = EgoStateGRU(input_dim=176, hidden_dim=256, output_dim=128, num_layers=1)
+        self.ego_gru = EgoStateGRU(input_dim=176, hidden_dim=256, output_dim=256, num_layers=1)
         
         # Ego + BEV Fusion 
         self.ego_fusion = BEV_Ego_Fusion()
@@ -104,7 +104,7 @@ class EndToEndModel(nn.Module):
         self.control = ControlMLP(future_steps=2, control_dim=3)
         
         # Future Ego Head 초기화 / 2176MB(+0MB)
-        self.ego_header = EgoStateHead(input_dim=128, hidden_dim=64, output_dim=21)
+        self.ego_header = EgoStateHead(input_dim=256, hidden_dim=128, output_dim=21)
         
         # BEV decoder 초기화 / 2176MB(+0MB)
         self.bev_decoder = Decoder(dim=128, blocks=decoder_blocks, residual=True, factor=2)
@@ -134,9 +134,9 @@ class EndToEndModel(nn.Module):
         fusion_ego = self.ego_fusion(bev_output, ego_embedding)
         # fusion_ego shape = [B, time_steps, 224]
 
-        ego_gru_output = self.ego_gru(fusion_ego)  
-        # ego_gru_output shape: [B, future_steps, 128]
-        
+        ego_gru_output, ego_gru_output_2 = self.ego_gru(fusion_ego)  
+        # ego_gru_output shape: [B, present_step + future_steps, 256]
+
         # Ego decoding
         future_ego = self.ego_header(ego_gru_output)
         # future_ego shape = [B, future_steps, 21]
@@ -149,9 +149,9 @@ class EndToEndModel(nn.Module):
         concat_bev = torch.cat([hd_features, bev_output], dim=2)  
         # concat_bev shape: [B, time_steps, 256, 18, 18]
         
-        # GRU를 통해 과거, 현재, 미래 정보를 추출 (여기서는 미래 정보만 사용)
+        # GRU를 통해 과거, 현재, 미래 정보를 추출
         _, gru_bev = self.bev_gru(concat_bev)  
-        # gru_bev shape: [B, future_steps, 128, 18, 18]
+        # gru_bev shape: [B, future_steps, 256, 25, 25]
 
         # Front-view Encoding (Traffic Light 관련 특징 추출)
         front_feature = self.traffic_encoder(batch["image"])  
@@ -162,7 +162,7 @@ class EndToEndModel(nn.Module):
         # classification_output shape: [B, num_classes]
 
         # Future Control 예측 (fusion된 feature 사용)
-        control_output = self.control(front_feature, gru_bev, ego_gru_output)
+        control_output = self.control(front_feature, gru_bev, ego_gru_output_2, batch["ego_info"])
         # control_output shape: [B, 3]
 
         return {
@@ -216,9 +216,10 @@ def main():
                 "intrinsics": data["intrinsic_input"].to(device),   # [B, num_views, 3, 3]
                 "extrinsics": data["extrinsic_input"].to(device),   # [B, num_views, 4, 4]
                 "hd_map": data["hd_map_input"].to(device),
-                "ego_info": data["ego_info"].to(device),
+                "ego_info": data["ego_info"].to(device),            # [B, 3, 12]
             }
-            ego_info_future_gt = data["ego_info_future"].to(device) # [B, 2, 21]
+
+            ego_info_future_gt = data["ego_info_future"].to(device) # [B, 2, 12]
             bev_seg_gt = data["gt_hd_map_input"].to(device)         # [B, T, 8, 144, 144]
             traffic_gt = data["traffic"].to(device)                 # [B, C]
             control_gt = data["control"].to(device)                 # [B, 3]

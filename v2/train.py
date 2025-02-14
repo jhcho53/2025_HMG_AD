@@ -14,6 +14,7 @@ from models.GRU import BEVGRU, EgoStateGRU
 from models.backbones.efficientnet import EfficientNetExtractor
 from models.control import FutureControlMLP, ControlMLP
 from utils.attention import FeatureFusionAttention
+from utils.utils import BEV_Ego_Fusion
 from dataloader.dataloader import camDataLoader
 
 
@@ -21,21 +22,25 @@ class EndToEndModel(nn.Module):
     """
     End-to-End 모델 클래스.
     입력 배치에서 이미지, intrinsics, extrinsics, HD map, ego_info 등을 받아
-    각 서브모듈을 거쳐 최종 제어 및 분류 출력을 생성합니다.
+    각 서브모듈(HD map 파이프라인, Ego GRU, BEV Encoder, Front-view Encoder,
+    Fusion Attention, 분류 및 제어 헤드)을 거쳐 최종 제어 및 분류 출력을 생성합니다.
     """
     def __init__(self, config):
+        """
+        config: dict 형태의 설정값. (이미지 크기, BEV 크기, decoder_blocks 등)
+        """
         super(EndToEndModel, self).__init__()
         # 기본 설정
-        image_h = config.get("image_h", 135)
-        image_w = config.get("image_w", 240)
-        bev_h = config.get("bev_h", 150)
-        bev_w = config.get("bev_w", 150)
+        image_h = config.get("image_h", 270)
+        image_w = config.get("image_w", 480)
+        bev_h = config.get("bev_h", 200)
+        bev_w = config.get("bev_w", 200)
         bev_h_meters = config.get("bev_h_meters", 50)
         bev_w_meters = config.get("bev_w_meters", 50)
         bev_offset = config.get("bev_offset", 0)
         decoder_blocks = config.get("decoder_blocks", [128, 128, 64])
 
-        # Backbone 초기화 (EfficientNetExtractor)
+        # Backbone 초기화 (EfficientNetExtractor) / 1634MB
         self.backbone = EfficientNetExtractor(
             model_name="efficientnet-b4",
             layer_names=["reduction_2", "reduction_4"],
@@ -64,7 +69,7 @@ class EndToEndModel(nn.Module):
             "decoder_blocks": decoder_blocks,
         }
         
-        # Encoder 초기화
+        # Encoder 초기화 / 1636MB(+2MB)
         self.encoder = Encoder(
             backbone=self.backbone,
             cross_view=cross_view_config,
@@ -74,33 +79,41 @@ class EndToEndModel(nn.Module):
             middle=[2, 2],
         )
         
-        # BEV GRU 모델 초기화
+        # BEV GRU 모델 초기화 / 1980MB(+344MB)
+        # 입력 채널 수: 256 (hd map feature 128 + encoder output 128)
+        # 출력 채널 수: 128
         input_dim = 256
         hidden_dim = 256
-        output_dim = 128
-        height, width = 18, 18
+        output_dim = 256
+        height, width = 25, 25
         self.bev_gru = BEVGRU(input_dim, hidden_dim, output_dim, height, width)
         
-        # Ego GRU 및 Feature Embedding 초기화
+        # # Ego GRU 모델 및 Feature Embedding 초기화 / 1980MB(+0MB)
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
-        self.ego_gru = EgoStateGRU(input_dim=112, hidden_dim=256, output_dim=128, num_layers=1)
+        self.ego_gru = EgoStateGRU(input_dim=176, hidden_dim=256, output_dim=256, num_layers=1)
         
-        # HD Map Feature Pipeline 초기화
-        self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=6, final_channels=128, final_size=(18, 18))
+        # Ego + BEV Fusion 
+        self.ego_fusion = BEV_Ego_Fusion()
+
+        # HD Map Feature Pipeline 초기화 / 2076MB(+96MB)
+        self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=7, final_channels=128, final_size=(25, 25))
         
-        # Front-view (Traffic) Encoder 초기화
+        # Front-view (Traffic) Encoder 초기화 / 2176MB(+100MB)
         self.traffic_encoder = TrafficLightEncoder(feature_dim=128, pretrained=True)
         
-        # Traffic Sign Classification Head 초기화
+        # # Feature Fusion Attention 초기화
+        # self.fusion_model = FeatureFusionAttention(feature_dim=128, bev_dim=128, time_steps=2, spatial_dim=32)
+        
+        # Traffic Sign Classification Head 초기화 / 2176MB(+0MB)
         self.classification_head = TrafficSignClassificationHead(input_dim=128, num_classes=10)
         
-        # Future Control Head (MLP) 초기화
+        # Future Control Head (MLP) 초기화 / 2176MB(+0MB)
         self.control = ControlMLP(future_steps=2, control_dim=3)
         
-        # Future Ego Head 초기화
-        self.ego_header = EgoStateHead(input_dim=128, hidden_dim=64, output_dim=21)
+        # Future Ego Head 초기화 / 2176MB(+0MB)
+        self.ego_header = EgoStateHead(input_dim=256, hidden_dim=128, output_dim=12)
         
-        # BEV decoder 초기화
+        # BEV decoder 초기화 / 2176MB(+0MB)
         self.bev_decoder = Decoder(dim=128, blocks=decoder_blocks, residual=True, factor=2)
     
     def forward(self, batch):
@@ -118,28 +131,34 @@ class EndToEndModel(nn.Module):
 
         # Ego Encoding
         ego_embedding = self.feature_embedding(batch["ego_info"])  
-        # ego_embedding shape: [B, seq_len, 112] (예시)
-        ego_gru_output = self.ego_gru(ego_embedding)  
-        # ego_gru_output shape: [B, future_steps, 128]
-        
+        # ego_embedding shape: [B, seq_len, 64]
+
+        # BEV Encoding
+        bev_output = self.encoder(batch)  
+        # bev_output shape: [B, time_steps, 128, 25, 25]
+
+        # fusion ego + bev
+        fusion_ego = self.ego_fusion(bev_output, ego_embedding)
+        # fusion_ego shape = [B, time_steps, 224]
+
+        ego_gru_output, ego_gru_output_2 = self.ego_gru(fusion_ego)  
+        # ego_gru_output shape: [B, present_step + future_steps, 256]
+
         # Ego decoding
         future_ego = self.ego_header(ego_gru_output)
         # future_ego shape = [B, future_steps, 21]
         
-        # BEV Encoding
-        bev_output = self.encoder(batch)  
-        # bev_output shape: [B, time_steps, 128, 18, 18]
-        
         # BEV Decoding
         bev_decoding = self.bev_decoder(bev_output)
-        # bev_decoding shape: [B, time_steps, 64, 144, 144]
-        
+        # bev_decoding shape: [B, time_steps, 8, 200, 200]
+
         # HD map feature와 BEV feature를 채널 차원에서 concat (256 채널)
         concat_bev = torch.cat([hd_features, bev_output], dim=2)  
         # concat_bev shape: [B, time_steps, 256, 18, 18]
-        # GRU를 통해 과거, 현재, 미래 정보를 추출 (여기서는 미래 정보만 사용)
+        
+        # GRU를 통해 과거, 현재, 미래 정보를 추출
         _, gru_bev = self.bev_gru(concat_bev)  
-        # gru_bev shape: [B, future_steps, 128, 18, 18]
+        # gru_bev shape: [B, future_steps, 256, 25, 25]
 
         # Front-view Encoding (Traffic Light 관련 특징 추출)
         front_feature = self.traffic_encoder(batch["image"])  
@@ -150,14 +169,14 @@ class EndToEndModel(nn.Module):
         # classification_output shape: [B, num_classes]
 
         # Future Control 예측 (fusion된 feature 사용)
-        control_output = self.control(front_feature, gru_bev, ego_gru_output)
+        control_output = self.control(front_feature, gru_bev, ego_gru_output_2, batch["ego_info"])
         # control_output shape: [B, 3]
 
         return {
-            "control": control_output,                      # [B, 3]
-            "classification": classification_output,        # [B, num_classes]
-            "future_ego": future_ego,                         # [B, future_steps, 21]
-            "bev_seg": bev_decoding                         # [B, time_steps, 64, 144, 144]
+            "control": control_output,                      # control_output shape: [B, 3]
+            "classification": classification_output,        # classification_output shape: [B, num_classes]
+            "future_ego": future_ego,                       # future_ego shape = [B, future_steps, 21]
+            "bev_seg": bev_decoding                         # bev_decoding shape: [B, time_steps, 64, 144, 144]
         }
 
 
@@ -193,10 +212,10 @@ def train(local_rank, args, distributed=False):
 
     # 모델 설정 값
     config = {
-        "image_h": 135,
-        "image_w": 240,
-        "bev_h": 150,
-        "bev_w": 150,
+        "image_h": 270,
+        "image_w": 480,
+        "bev_h": 200,
+        "bev_w": 200,
         "bev_h_meters": 50,
         "bev_w_meters": 50,
         "bev_offset": 0,
@@ -218,7 +237,7 @@ def train(local_rank, args, distributed=False):
     seg_loss_fn = nn.MSELoss()
     
     # 데이터셋 초기화 (하나의 dataset 인스턴스를 사용)
-    root_dir = "/home/vip/hd/Dataset"  # 실제 데이터셋 경로로 수정
+    root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample"  # 실제 데이터셋 경로로 수정
     dataset = camDataLoader(root_dir, num_timesteps=3)
     
     # 분산 모드이면 DistributedSampler 사용, 아니면 기본 DataLoader 사용
@@ -229,10 +248,10 @@ def train(local_rank, args, distributed=False):
             rank=rank,
             shuffle=True
         )
-        dataloader = get_dataloader(dataset, batch_size=16, sampler=sampler)
+        dataloader = get_dataloader(dataset, batch_size=4, sampler=sampler)
     else:
         sampler = None
-        dataloader = get_dataloader(dataset, batch_size=16, sampler=None)
+        dataloader = get_dataloader(dataset, batch_size=4, sampler=None)
     
     num_epochs = 1
     model.train()
@@ -296,7 +315,7 @@ def train(local_rank, args, distributed=False):
     
     # rank 0에서만 모델 저장 (DDP로 래핑한 경우 실제 모델은 model.module에 위치)
     if rank == 0:
-        torch.save(model.module.state_dict() if distributed else model.state_dict(), "end_to_end_model.pth")
+        torch.save(model.module.state_dict() if distributed else model.state_dict(), "end_to_end_model_test.pth")
         print("Training complete and model saved.")
     
     # 분산 모드이면 분산 프로세스 그룹 종료

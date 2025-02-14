@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class BEVGRU(nn.Module):
-    def __init__(self, input_channels, hidden_dim, output_dim, height, width, dropout_prob=0.5):
+    def __init__(self, input_channels, hidden_dim, output_dim, height, width, dropout_prob=0.1):
         super(BEVGRU, self).__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
@@ -66,11 +66,11 @@ class BEVGRU(nn.Module):
         # Extract current & future BEV
         current_bev = total_output[:, current_index].unsqueeze(1)  # [batch, 1, output_dim, height, width]
         future_bev = total_output[:, current_index + 1 : current_index + 1 + future_steps]  # [batch, 2, output_dim, height, width]
-
+        future_bev = torch.cat((current_bev, future_bev), dim=1)
         return total_output, future_bev
     
 class EgoStateGRU(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1, dropout_prob=0.5):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1, dropout_prob=0.1):
         """
         Args:
             input_dim (int): Input feature dimension (e.g., 112 for ego state embedding).
@@ -106,7 +106,7 @@ class EgoStateGRU(nn.Module):
         batch_size, seq_len, _ = x.size()
 
         # GRU forward pass (과거 2개 + 현재)
-        gru_out, hidden_state = self.gru(x)  # [batch_size, seq_len, hidden_dim]
+        gru_out, hidden_state = self.gru(x)  # [seq_len, batch_size, hidden_dim]
 
         # Initialize future predictions
         future_pred = []
@@ -129,8 +129,9 @@ class EgoStateGRU(nn.Module):
 
         # 🔹 Concatenate future predictions
         future_pred = torch.cat(future_pred, dim=1)  # [batch_size, future_steps, output_dim]
-
-        return future_pred
+        hidden_state = hidden_state.transpose(0, 1)  # [B, Present, output_dim]
+        future_pred_2 = torch.cat((hidden_state,future_pred),dim=1)    # [batch_size, present_step + future_steps, output_dim]
+        return future_pred, future_pred_2
     
 class FutureControlGRU(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
