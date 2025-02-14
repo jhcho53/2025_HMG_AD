@@ -203,7 +203,7 @@ def main():
     model = EndToEndModel(config).to(device)
 
     # 데이터 로더 초기화 (root_dir 경로는 실제 데이터셋 경로로 수정)
-    root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample"
+    root_dir = "/home/vip/hd/Dataset"
     dataloader = get_dataloader(root_dir, num_timesteps=3, batch_size=1)
     
     # 배치 단위로 forward pass 수행

@@ -1,10 +1,11 @@
 import os
 import argparse
+import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 
 # (기존의 import 구문 유지)
@@ -22,13 +23,9 @@ class EndToEndModel(nn.Module):
     """
     End-to-End 모델 클래스.
     입력 배치에서 이미지, intrinsics, extrinsics, HD map, ego_info 등을 받아
-    각 서브모듈(HD map 파이프라인, Ego GRU, BEV Encoder, Front-view Encoder,
-    Fusion Attention, 분류 및 제어 헤드)을 거쳐 최종 제어 및 분류 출력을 생성합니다.
+    각 서브모듈을 거쳐 최종 제어 및 분류 출력을 생성합니다.
     """
     def __init__(self, config):
-        """
-        config: dict 형태의 설정값. (이미지 크기, BEV 크기, decoder_blocks 등)
-        """
         super(EndToEndModel, self).__init__()
         # 기본 설정
         image_h = config.get("image_h", 270)
@@ -40,7 +37,7 @@ class EndToEndModel(nn.Module):
         bev_offset = config.get("bev_offset", 0)
         decoder_blocks = config.get("decoder_blocks", [128, 128, 64])
 
-        # Backbone 초기화 (EfficientNetExtractor) / 1634MB
+        # Backbone 초기화
         self.backbone = EfficientNetExtractor(
             model_name="efficientnet-b4",
             layer_names=["reduction_2", "reduction_4"],
@@ -58,7 +55,6 @@ class EndToEndModel(nn.Module):
             "image_width": image_w,
         }
         
-        # BEVEmbedding 관련 설정
         bev_embedding_config = {
             "sigma": 1.0,
             "bev_height": bev_h,
@@ -69,7 +65,6 @@ class EndToEndModel(nn.Module):
             "decoder_blocks": decoder_blocks,
         }
         
-        # Encoder 초기화 / 1636MB(+2MB)
         self.encoder = Encoder(
             backbone=self.backbone,
             cross_view=cross_view_config,
@@ -79,138 +74,141 @@ class EndToEndModel(nn.Module):
             middle=[2, 2],
         )
         
-        # BEV GRU 모델 초기화 / 1980MB(+344MB)
-        # 입력 채널 수: 256 (hd map feature 128 + encoder output 128)
-        # 출력 채널 수: 128
         input_dim = 256
         hidden_dim = 256
         output_dim = 256
         height, width = 25, 25
         self.bev_gru = BEVGRU(input_dim, hidden_dim, output_dim, height, width)
         
-        # # Ego GRU 모델 및 Feature Embedding 초기화 / 1980MB(+0MB)
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
         self.ego_gru = EgoStateGRU(input_dim=176, hidden_dim=256, output_dim=256, num_layers=1)
-        
-        # Ego + BEV Fusion 
         self.ego_fusion = BEV_Ego_Fusion()
 
-        # HD Map Feature Pipeline 초기화 / 2076MB(+96MB)
         self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=7, final_channels=128, final_size=(25, 25))
-        
-        # Front-view (Traffic) Encoder 초기화 / 2176MB(+100MB)
         self.traffic_encoder = TrafficLightEncoder(feature_dim=128, pretrained=True)
-        
-        # # Feature Fusion Attention 초기화
-        # self.fusion_model = FeatureFusionAttention(feature_dim=128, bev_dim=128, time_steps=2, spatial_dim=32)
-        
-        # Traffic Sign Classification Head 초기화 / 2176MB(+0MB)
         self.classification_head = TrafficSignClassificationHead(input_dim=128, num_classes=10)
-        
-        # Future Control Head (MLP) 초기화 / 2176MB(+0MB)
         self.control = ControlMLP(future_steps=2, control_dim=3)
-        
-        # Future Ego Head 초기화 / 2176MB(+0MB)
         self.ego_header = EgoStateHead(input_dim=256, hidden_dim=128, output_dim=12)
-        
-        # BEV decoder 초기화 / 2176MB(+0MB)
         self.bev_decoder = Decoder(dim=128, blocks=decoder_blocks, residual=True, factor=2)
     
     def forward(self, batch):
-        """
-        batch: dict with keys
-            - "image": [B, num_views, C, H, W]
-            - "intrinsics": [B, num_views, 3, 3]
-            - "extrinsics": [B, num_views, 4, 4]
-            - "hd_map": [B, time_steps, ...]
-            - "ego_info": [B, ...]
-        """
-        # HD Map Encoding
-        hd_features = self.hd_map_pipeline(batch["hd_map"])  
-        # hd_features shape: [B, time_steps, 128, 18, 18]
-
-        # Ego Encoding
-        ego_embedding = self.feature_embedding(batch["ego_info"])  
-        # ego_embedding shape: [B, seq_len, 64]
-
-        # BEV Encoding
-        bev_output = self.encoder(batch)  
-        # bev_output shape: [B, time_steps, 128, 25, 25]
-
-        # fusion ego + bev
+        hd_features = self.hd_map_pipeline(batch["hd_map"])
+        ego_embedding = self.feature_embedding(batch["ego_info"])
+        bev_output = self.encoder(batch)
         fusion_ego = self.ego_fusion(bev_output, ego_embedding)
-        # fusion_ego shape = [B, time_steps, 224]
-
-        ego_gru_output, ego_gru_output_2 = self.ego_gru(fusion_ego)  
-        # ego_gru_output shape: [B, present_step + future_steps, 256]
-
-        # Ego decoding
+        ego_gru_output, ego_gru_output_2 = self.ego_gru(fusion_ego)
         future_ego = self.ego_header(ego_gru_output)
-        # future_ego shape = [B, future_steps, 21]
-        
-        # BEV Decoding
         bev_decoding = self.bev_decoder(bev_output)
-        # bev_decoding shape: [B, time_steps, 8, 200, 200]
-
-        # HD map feature와 BEV feature를 채널 차원에서 concat (256 채널)
-        concat_bev = torch.cat([hd_features, bev_output], dim=2)  
-        # concat_bev shape: [B, time_steps, 256, 18, 18]
-        
-        # GRU를 통해 과거, 현재, 미래 정보를 추출
-        _, gru_bev = self.bev_gru(concat_bev)  
-        # gru_bev shape: [B, future_steps, 256, 25, 25]
-
-        # Front-view Encoding (Traffic Light 관련 특징 추출)
-        front_feature = self.traffic_encoder(batch["image"])  
-        # front_feature shape: [B, 128]
-
-        # Traffic Sign Classification Head (front feature 사용)
-        classification_output = self.classification_head(front_feature)  
-        # classification_output shape: [B, num_classes]
-
-        # Future Control 예측 (fusion된 feature 사용)
+        concat_bev = torch.cat([hd_features, bev_output], dim=2)
+        _, gru_bev = self.bev_gru(concat_bev)
+        front_feature = self.traffic_encoder(batch["image"])
+        classification_output = self.classification_head(front_feature)
         control_output = self.control(front_feature, gru_bev, ego_gru_output_2, batch["ego_info"])
-        # control_output shape: [B, 3]
-
         return {
-            "control": control_output,                      # control_output shape: [B, 3]
-            "classification": classification_output,        # classification_output shape: [B, num_classes]
-            "future_ego": future_ego,                       # future_ego shape = [B, future_steps, 21]
-            "bev_seg": bev_decoding                         # bev_decoding shape: [B, time_steps, 64, 144, 144]
+            "control": control_output,
+            "classification": classification_output,
+            "future_ego": future_ego,
+            "bev_seg": bev_decoding
         }
 
 
 def get_dataloader(dataset, batch_size=16, sampler=None):
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
+
+
+def validate_model(model, dataloader, device, classification_loss_fn, control_loss_fn, ego_loss_fn, seg_loss_fn, logger):
     """
-    데이터셋과 DataLoader 초기화 함수.
-    DistributedSampler가 제공되면 이를 사용.
+    validation 단계에서 모델의 성능을 평가하는 함수.
     """
-    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=False)
-    return dataloader
+    model.eval()
+    total_loss = 0.0
+    total_classification_loss = 0.0
+    total_control_loss = 0.0
+    total_ego_loss = 0.0
+    total_seg_loss = 0.0
+    count = 0
+
+    with torch.no_grad():
+        for data in dataloader:
+            batch = {
+                "image": data["images_input"].to(device),
+                "intrinsics": data["intrinsic_input"].to(device),
+                "extrinsics": data["extrinsic_input"].to(device),
+                "hd_map": data["hd_map_input"].to(device),
+                "ego_info": data["ego_info"].to(device),
+            }
+            ego_info_future_gt = data["ego_info_future"].to(device)
+            bev_seg_gt = data["gt_hd_map_input"].to(device)
+            traffic_gt = data["traffic"].to(device)
+            traffic_gt_indices = torch.argmax(traffic_gt, dim=1)
+            control_gt = data["control"].to(device)
+
+            with torch.amp.autocast(device_type="cuda"):
+                outputs = model(batch)
+                control_pred = outputs["control"]
+                classification_pred = outputs["classification"]
+                future_ego_pred = outputs["future_ego"]
+                bev_seg_pred = outputs["bev_seg"]
+
+                loss_classification = classification_loss_fn(classification_pred, traffic_gt_indices)
+                loss_control = control_loss_fn(control_pred, control_gt)
+                loss_ego = ego_loss_fn(future_ego_pred, ego_info_future_gt)
+                loss_seg = seg_loss_fn(bev_seg_pred, bev_seg_gt)
+                loss = loss_classification + loss_control + loss_ego + loss_seg
+
+            total_loss += loss.item()
+            total_classification_loss += loss_classification.item()
+            total_control_loss += loss_control.item()
+            total_ego_loss += loss_ego.item()
+            total_seg_loss += loss_seg.item()
+            count += 1
+
+    avg_loss = total_loss / count if count > 0 else 0
+    avg_classification_loss = total_classification_loss / count if count > 0 else 0
+    avg_control_loss = total_control_loss / count if count > 0 else 0
+    avg_ego_loss = total_ego_loss / count if count > 0 else 0
+    avg_seg_loss = total_seg_loss / count if count > 0 else 0
+
+    logger.info(f"Validation - Avg Total Loss: {avg_loss:.4f}, Classification: {avg_classification_loss:.4f}, "
+                f"Control: {avg_control_loss:.4f}, Ego: {avg_ego_loss:.4f}, BEV Seg: {avg_seg_loss:.4f}")
+    return avg_loss, avg_classification_loss, avg_control_loss, avg_ego_loss, avg_seg_loss
 
 
 def train(local_rank, args, distributed=False):
+    # 분산 환경 설정
     if distributed:
-        # 분산 환경을 위한 일부 환경 변수 설정 (실행 환경에 따라 torchrun 등에서 자동 설정될 수 있음)
-        os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+        os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
         os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
-        
-        # 분산 환경 초기화 (init_method='env://'를 사용)
         dist.init_process_group(backend='nccl', init_method='env://')
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-
-        if rank == 0:
-            print(f"Using distributed training with {world_size} processes.")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         rank = 0
         world_size = 1
-        print(f"Using single GPU mode on device: {device}")
 
-    # 모델 설정 값
+    # logger 설정 (rank 0에서만 파일에 기록)
+    logger = logging.getLogger("train_logger")
+    logger.setLevel(logging.INFO)
+    if rank == 0:
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        # 파일 핸들러
+        fh = logging.FileHandler("training.log")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+        # 콘솔 핸들러
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+        logger.info(f"Using {'distributed' if distributed else 'single GPU'} training with {world_size} process(es) on device: {device}")
+    else:
+        # rank 0가 아닌 프로세스는 별도의 핸들러를 추가하지 않습니다.
+        logger.addHandler(logging.NullHandler())
+
     config = {
         "image_h": 270,
         "image_w": 480,
@@ -222,103 +220,132 @@ def train(local_rank, args, distributed=False):
         "decoder_blocks": [128, 128, 64],
     }
     
-    # End-to-End 모델 초기화 및 device로 이동
     model = EndToEndModel(config).to(device)
     
-    # 분산 모드이면 DDP로 모델 래핑
+    for param in model.parameters():
+        if not param.is_contiguous():
+            param.data = param.data.contiguous()
+
+    # 분산 환경에서는 SyncBatchNorm으로 변환하여 각 GPU의 배치 정규화 통계를 동기화합니다.
     if distributed:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, gradient_as_bucket_view=False)
     
-    # 옵티마이저 및 손실 함수 정의
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     classification_loss_fn = nn.CrossEntropyLoss()
     control_loss_fn = nn.MSELoss()
     ego_loss_fn = nn.MSELoss()
     seg_loss_fn = nn.MSELoss()
     
-    # 데이터셋 초기화 (하나의 dataset 인스턴스를 사용)
-    root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample"  # 실제 데이터셋 경로로 수정
+    # AMP: GradScaler와 autocast 사용
+    scaler = torch.amp.GradScaler(device="cuda")
+    root_dir = "/home/vip/hd/Dataset"
+    # root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample"  # 실제 데이터셋 경로로 수정
     dataset = camDataLoader(root_dir, num_timesteps=3)
     
-    # 분산 모드이면 DistributedSampler 사용, 아니면 기본 DataLoader 사용
-    if distributed:
-        sampler = DistributedSampler(
-            dataset=dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True
-        )
-        dataloader = get_dataloader(dataset, batch_size=4, sampler=sampler)
-    else:
-        sampler = None
-        dataloader = get_dataloader(dataset, batch_size=4, sampler=None)
+    # 학습 데이터와 검증 데이터를 80:20 비율로 분할합니다.
+    total_samples = len(dataset)
+    train_samples = int(0.8 * total_samples)
+    val_samples = total_samples - train_samples
+    train_dataset, val_dataset = random_split(dataset, [train_samples, val_samples])
     
-    num_epochs = 1
+    if distributed:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=4, sampler=train_sampler)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=4, sampler=val_sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+    
+    # 예시로 num_epochs를 50으로 설정 (필요에 따라 조정)
+    num_epochs = 50
     model.train()
     
     for epoch in range(num_epochs):
-        # 매 epoch마다 sampler의 시드를 변경해 데이터 셔플링 보장 (distributed 모드에서만)
         if distributed:
-            sampler.set_epoch(epoch)
+            train_sampler.set_epoch(epoch)
         running_loss = 0.0
-        for batch_idx, data in enumerate(dataloader):
-            if data is None:  # None 데이터가 전달되었는지 확인
-                print(f"Warning: Skipping batch {batch_idx} due to empty data.")
-                break  # 배치가 None이면 skip.
+        running_loss_classification = 0.0
+        running_loss_control = 0.0
+        running_loss_ego = 0.0
+        running_loss_seg = 0.0
 
-            # 데이터의 각 항목을 device로 이동
+        for batch_idx, data in enumerate(train_loader):
+            if data is None:
+                logger.warning(f"Warning: Skipping batch {batch_idx} due to empty data.")
+                break
+
             batch = {
-                "image": data["images_input"].to(device),           # [B, T, num_views, C, H, W]
-                "intrinsics": data["intrinsic_input"].to(device),     # [B, num_views, 3, 3]
-                "extrinsics": data["extrinsic_input"].to(device),     # [B, num_views, 4, 4]
+                "image": data["images_input"].to(device),
+                "intrinsics": data["intrinsic_input"].to(device),
+                "extrinsics": data["extrinsic_input"].to(device),
                 "hd_map": data["hd_map_input"].to(device),
                 "ego_info": data["ego_info"].to(device),
             }
-
-            # Ground Truth (GT)
-            ego_info_future_gt = data["ego_info_future"].to(device)   # [B, future_steps, 21]
-            bev_seg_gt = data["gt_hd_map_input"].to(device)            # [B, T, 6, 144, 144]
-            traffic_gt = data["traffic"].to(device)                    # [B, num_classes]
-            traffic_gt_indices = torch.argmax(traffic_gt, dim=1)         # [B]
-            control_gt = data["control"].to(device)                    # [B, 3]
+            ego_info_future_gt = data["ego_info_future"].to(device)
+            bev_seg_gt = data["gt_hd_map_input"].to(device)
+            traffic_gt = data["traffic"].to(device)
+            traffic_gt_indices = torch.argmax(traffic_gt, dim=1)
+            control_gt = data["control"].to(device)
             
             optimizer.zero_grad()
-            outputs = model(batch)
-            control_pred = outputs["control"]
-            classification_pred = outputs["classification"]
-            future_ego_pred = outputs["future_ego"]
-            bev_seg_pred = outputs["bev_seg"]
+            with torch.amp.autocast(device_type="cuda"):
+                outputs = model(batch)
+                control_pred = outputs["control"]
+                classification_pred = outputs["classification"]
+                future_ego_pred = outputs["future_ego"]
+                bev_seg_pred = outputs["bev_seg"]
+                
+                loss_classification = classification_loss_fn(classification_pred, traffic_gt_indices)
+                loss_control = control_loss_fn(control_pred, control_gt)
+                loss_ego = ego_loss_fn(future_ego_pred, ego_info_future_gt)
+                loss_seg = seg_loss_fn(bev_seg_pred, bev_seg_gt)
+                loss = loss_classification + loss_control + loss_ego + loss_seg
             
-            # 손실 계산 (각 손실을 합산)
-            loss_classification = classification_loss_fn(classification_pred, traffic_gt_indices)
-            loss_control = control_loss_fn(control_pred, control_gt)
-            loss_ego = ego_loss_fn(future_ego_pred, ego_info_future_gt)
-            loss_seg = seg_loss_fn(bev_seg_pred, bev_seg_gt)
-            loss = loss_classification + loss_control + loss_ego + loss_seg
-            
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += loss.item()
-            # rank 0에서만 출력 (단일 모드에서는 항상 rank 0)
+            running_loss_classification += loss_classification.item()
+            running_loss_control += loss_control.item()
+            running_loss_ego += loss_ego.item()
+            running_loss_seg += loss_seg.item()
+            
             if batch_idx % 10 == 0 and rank == 0:
-                print(f"[Epoch {epoch+1}/{num_epochs}] Batch {batch_idx}")
-                print(f"  Classification Loss: {loss_classification.item():.4f}")
-                print(f"  Control Loss      : {loss_control.item():.4f}")
-                print(f"  Ego State Loss    : {loss_ego.item():.4f}")
-                print(f"  BEV Segmentation Loss: {loss_seg.item():.4f}")
-                print(f"  Total Loss        : {loss.item():.4f}")
+                logger.info(f"[Epoch {epoch+1}/{num_epochs}] Batch {batch_idx} - "
+                            f"Classification Loss: {loss_classification.item():.4f}, "
+                            f"Control Loss: {loss_control.item():.4f}, "
+                            f"Ego State Loss: {loss_ego.item():.4f}, "
+                            f"BEV Segmentation Loss: {loss_seg.item():.4f}, "
+                            f"Total Loss: {loss.item():.4f}")
         
-        epoch_loss = running_loss / len(dataloader)
+        avg_epoch_loss = running_loss / len(train_loader)
+        avg_epoch_class_loss = running_loss_classification / len(train_loader)
+        avg_epoch_control_loss = running_loss_control / len(train_loader)
+        avg_epoch_ego_loss = running_loss_ego / len(train_loader)
+        avg_epoch_seg_loss = running_loss_seg / len(train_loader)
+
         if rank == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}] Average Loss: {epoch_loss:.4f}")
+            logger.info(f"Epoch [{epoch+1}/{num_epochs}] Training Summary:")
+            logger.info(f"  Avg Total Loss           : {avg_epoch_loss:.4f}")
+            logger.info(f"  Avg Classification Loss  : {avg_epoch_class_loss:.4f}")
+            logger.info(f"  Avg Control Loss         : {avg_epoch_control_loss:.4f}")
+            logger.info(f"  Avg Ego State Loss       : {avg_epoch_ego_loss:.4f}")
+            logger.info(f"  Avg BEV Segmentation Loss: {avg_epoch_seg_loss:.4f}")
+        
+        # 10 epoch마다 검증 단계 수행
+        if (epoch + 1) % 10 == 0 and rank == 0:
+            logger.info("Running validation...")
+            validate_model(model, val_loader, device, classification_loss_fn, control_loss_fn, ego_loss_fn, seg_loss_fn, logger)
+            # 검증 후 다시 학습 모드로 전환
+            model.train()
     
-    # rank 0에서만 모델 저장 (DDP로 래핑한 경우 실제 모델은 model.module에 위치)
     if rank == 0:
         torch.save(model.module.state_dict() if distributed else model.state_dict(), "end_to_end_model_test.pth")
-        print("Training complete and model saved.")
+        logger.info("Training complete and model saved.")
     
-    # 분산 모드이면 분산 프로세스 그룹 종료
     if distributed:
         dist.destroy_process_group()
 
@@ -331,17 +358,12 @@ if __name__ == "__main__":
                         help="Enable distributed training across multiple GPUs.")
     args = parser.parse_args()
 
-    # distributed 모드일 경우, torchrun 또는 기타 분산 런처에 의해 LOCAL_RANK가 설정되어 있으면 우선 사용
     if args.distributed:
-        if "LOCAL_RANK" in os.environ:
-            local_rank = int(os.environ["LOCAL_RANK"])
-        else:
-            local_rank = args.local_rank
+        local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     else:
-        local_rank = 0  # 단일 GPU 모드에서는 0번 GPU 사용
+        local_rank = 0
 
     train(local_rank, args, distributed=args.distributed)
 
-# 실행 예시:
 # 분산 모드: torchrun --nproc_per_node=2 train.py --distributed
 # 단일 GPU 모드: python train.py
