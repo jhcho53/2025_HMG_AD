@@ -116,9 +116,10 @@ def get_dataloader(dataset, batch_size=16, sampler=None):
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
 
 
-def validate_model(model, dataloader, device, classification_loss_fn, control_loss_fn, ego_loss_fn, seg_loss_fn, logger):
+def validate_model(model, dataloader, device, classification_loss_fn, control_loss_fn, ego_loss_fn, seg_loss_fn, logger, val_logger=None):
     """
     validation 단계에서 모델의 성능을 평가하는 함수.
+    val_logger가 제공되면 별도 파일로도 validation 결과를 기록합니다.
     """
     model.eval()
     total_loss = 0.0
@@ -169,8 +170,14 @@ def validate_model(model, dataloader, device, classification_loss_fn, control_lo
     avg_ego_loss = total_ego_loss / count if count > 0 else 0
     avg_seg_loss = total_seg_loss / count if count > 0 else 0
 
-    logger.info(f"Validation - Avg Total Loss: {avg_loss:.4f}, Classification: {avg_classification_loss:.4f}, "
-                f"Control: {avg_control_loss:.4f}, Ego: {avg_ego_loss:.4f}, BEV Seg: {avg_seg_loss:.4f}")
+    log_msg = (f"Validation - Avg Total Loss: {avg_loss:.4f}, "
+               f"Classification: {avg_classification_loss:.4f}, "
+               f"Control: {avg_control_loss:.4f}, "
+               f"Ego: {avg_ego_loss:.4f}, "
+               f"BEV Seg: {avg_seg_loss:.4f}")
+    logger.info(log_msg)
+    if val_logger is not None:
+        val_logger.info(log_msg)
     return avg_loss, avg_classification_loss, avg_control_loss, avg_ego_loss, avg_seg_loss
 
 
@@ -192,9 +199,9 @@ def train(local_rank, args, distributed=False):
     # logger 설정 (rank 0에서만 파일에 기록)
     logger = logging.getLogger("train_logger")
     logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     if rank == 0:
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        # 파일 핸들러
+        # 파일 핸들러 (training.log)
         fh = logging.FileHandler("training.log")
         fh.setLevel(logging.INFO)
         fh.setFormatter(formatter)
@@ -205,9 +212,16 @@ def train(local_rank, args, distributed=False):
         ch.setFormatter(formatter)
         logger.addHandler(ch)
         logger.info(f"Using {'distributed' if distributed else 'single GPU'} training with {world_size} process(es) on device: {device}")
+        # validation logger 설정 (validation.log)
+        val_logger = logging.getLogger("val_logger")
+        val_logger.setLevel(logging.INFO)
+        val_fh = logging.FileHandler("validation.log")
+        val_fh.setLevel(logging.INFO)
+        val_fh.setFormatter(formatter)
+        val_logger.addHandler(val_fh)
     else:
-        # rank 0가 아닌 프로세스는 별도의 핸들러를 추가하지 않습니다.
         logger.addHandler(logging.NullHandler())
+        val_logger = None
 
     config = {
         "image_h": 270,
@@ -240,7 +254,7 @@ def train(local_rank, args, distributed=False):
     # AMP: GradScaler와 autocast 사용
     scaler = torch.amp.GradScaler(device="cuda")
     root_dir = "/home/vip/hd/Dataset"
-    # root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample"  # 실제 데이터셋 경로로 수정
+    # root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample" 
     dataset = camDataLoader(root_dir, num_timesteps=3)
     
     # 학습 데이터와 검증 데이터를 80:20 비율로 분할합니다.
@@ -258,11 +272,16 @@ def train(local_rank, args, distributed=False):
         train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     
-    # 예시로 num_epochs를 50으로 설정 (필요에 따라 조정)
-    num_epochs = 50
+    num_epochs = 3
     model.train()
     
+    # early stopping 관련 변수 초기화
+    best_val_loss = float("inf")
+    early_stop_counter = 0
+    early_stop_patience = args.early_stop_patience
+
     for epoch in range(num_epochs):
+        print("hi")
         if distributed:
             train_sampler.set_epoch(epoch)
         running_loss = 0.0
@@ -271,6 +290,7 @@ def train(local_rank, args, distributed=False):
         running_loss_ego = 0.0
         running_loss_seg = 0.0
 
+        total_batches = len(train_loader)
         for batch_idx, data in enumerate(train_loader):
             if data is None:
                 logger.warning(f"Warning: Skipping batch {batch_idx} due to empty data.")
@@ -313,6 +333,7 @@ def train(local_rank, args, distributed=False):
             running_loss_ego += loss_ego.item()
             running_loss_seg += loss_seg.item()
             
+            # 주기적인 학습 상태 로그 출력 (10 배치마다)
             if batch_idx % 10 == 0 and rank == 0:
                 logger.info(f"[Epoch {epoch+1}/{num_epochs}] Batch {batch_idx} - "
                             f"Classification Loss: {loss_classification.item():.4f}, "
@@ -320,6 +341,13 @@ def train(local_rank, args, distributed=False):
                             f"Ego State Loss: {loss_ego.item():.4f}, "
                             f"BEV Segmentation Loss: {loss_seg.item():.4f}, "
                             f"Total Loss: {loss.item():.4f}")
+
+            # 중간 validation: epoch의 절반 배치가 끝난 시점에서 validation 수행
+            if rank == 0 and (batch_idx + 1) == (total_batches // 2):
+                logger.info(f"Epoch {epoch+1} Mid-Epoch Validation...")
+                validate_model(model, val_loader, device, classification_loss_fn, control_loss_fn,
+                               ego_loss_fn, seg_loss_fn, logger, val_logger)
+                model.train()  # validation 후 다시 train 모드로 전환
         
         avg_epoch_loss = running_loss / len(train_loader)
         avg_epoch_class_loss = running_loss_classification / len(train_loader)
@@ -334,13 +362,23 @@ def train(local_rank, args, distributed=False):
             logger.info(f"  Avg Control Loss         : {avg_epoch_control_loss:.4f}")
             logger.info(f"  Avg Ego State Loss       : {avg_epoch_ego_loss:.4f}")
             logger.info(f"  Avg BEV Segmentation Loss: {avg_epoch_seg_loss:.4f}")
-        
-        # 10 epoch마다 검증 단계 수행
-        if (epoch + 1) % 10 == 0 and rank == 0:
-            logger.info("Running validation...")
-            validate_model(model, val_loader, device, classification_loss_fn, control_loss_fn, ego_loss_fn, seg_loss_fn, logger)
-            # 검증 후 다시 학습 모드로 전환
+            
+            logger.info(f"Epoch {epoch+1} End-of-Epoch Validation...")
+            val_loss, _, _, _, _ = validate_model(model, val_loader, device, classification_loss_fn, control_loss_fn,
+                                                    ego_loss_fn, seg_loss_fn, logger, val_logger)
             model.train()
+
+            # early stopping 체크 (validation loss 기준)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                early_stop_counter = 0
+                logger.info(f"Validation loss improved to {val_loss:.4f}.")
+            else:
+                early_stop_counter += 1
+                logger.info(f"No improvement in validation loss for {early_stop_counter} epoch(s).")
+                if early_stop_counter >= early_stop_patience:
+                    logger.info(f"Early stopping triggered. Stopping training at epoch {epoch+1}.")
+                    break  # training loop 종료
     
     if rank == 0:
         torch.save(model.module.state_dict() if distributed else model.state_dict(), "end_to_end_model_test.pth")
@@ -356,6 +394,8 @@ if __name__ == "__main__":
                         help="Local rank. Provided by distributed launcher if using distributed training.")
     parser.add_argument("--distributed", action="store_true",
                         help="Enable distributed training across multiple GPUs.")
+    parser.add_argument("--early_stop_patience", type=int, default=2,
+                        help="Early stopping patience (number of epochs with no improvement) before stopping training early.")
     args = parser.parse_args()
 
     if args.distributed:
