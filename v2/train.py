@@ -272,7 +272,7 @@ def train(local_rank, args, distributed=False):
         train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     
-    num_epochs = 3
+    num_epochs = 1
     model.train()
     
     # early stopping 관련 변수 초기화
