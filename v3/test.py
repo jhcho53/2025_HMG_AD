@@ -121,55 +121,51 @@ class EndToEndModel(nn.Module):
         # hd_features shape: [B, time_steps, 128, 18, 18]
 
         # Ego Encoding
-        ego_embedding = self.feature_embedding(batch["ego_info"])  
+        ego_embedding = self.feature_embedding(batch["ego_info"])
         # ego_embedding shape: [B, seq_len, 64]
 
         # BEV Encoding
-        bev_output = self.encoder(batch)  
+        bev_output = self.encoder(batch)
         # bev_output shape: [B, time_steps, 128, 25, 25]
-
         # fusion ego + bev
-        fusion_ego = self.ego_fusion(bev_output, ego_embedding)
-        # fusion_ego shape = [B, time_steps, 224]
+        # fusion_ego = self.ego_fusion(bev_output, ego_embedding)
+        # # fusion_ego shape = [B, time_steps, 224]
 
-        ego_gru_output, ego_gru_output_2 = self.ego_gru(fusion_ego)  
-        # ego_gru_output shape: [B, present_step + future_steps, 256]
+        # ego_gru_output, ego_gru_output_2 = self.ego_gru(fusion_ego)  
+        # # ego_gru_output shape: [B, present_step + future_steps, 256]
 
-        # Ego decoding
-        future_ego = self.ego_header(ego_gru_output)
-        # future_ego shape = [B, future_steps, 21]
+        # # Ego decoding
+        # future_ego = self.ego_header(ego_gru_output)
+        # # future_ego shape = [B, future_steps, 21]
         
         # BEV Decoding
         bev_decoding = self.bev_decoder(bev_output)
         # bev_decoding shape: [B, 8, 200, 200]
 
         # HD map feature와 BEV feature를 채널 차원에서 concat (256 채널)
-        concat_bev = torch.cat([hd_features, bev_output], dim=2)  
-        # concat_bev shape: [B, time_steps, 256, 18, 18]
+        concat_bev = torch.cat([hd_features, bev_output], dim=2)
+        # concat_bev shape: [B, time_steps, 256, 25, 25]
 
         # # GRU를 통해 과거, 현재, 미래 정보를 추출
         # _, gru_bev = self.bev_gru(concat_bev)  
         # # gru_bev shape: [B, future_steps, 256, 25, 25]
 
-        # Front-view Encoding (Traffic Light 관련 특징 추출)
-        front_feature = self.traffic_encoder(batch["image"])  
-        # front_feature shape: [B, 128]
+        # # Front-view Encoding (Traffic Light 관련 특징 추출)
+        # front_feature = self.traffic_encoder(batch["image"])  
+        # # front_feature shape: [B, 128]
 
-        # Traffic Sign Classification Head (front feature 사용)
-        classification_output = self.classification_head(front_feature)  
-        # classification_output shape: [B, num_classes]
+        # # Traffic Sign Classification Head (front feature 사용)
+        # classification_output = self.classification_head(front_feature)  
+        # # classification_output shape: [B, num_classes]
 
         # Future Control 예측 (fusion된 feature 사용)
-        control_output = self.control(front_feature, gru_bev, ego_gru_output_2, batch["ego_info"])
+        # control_output = self.control(front_feature, gru_bev, ego_gru_output_2, batch["ego_info"])
         # control_output shape: [B, 3]
 
-        _, planner = self.decoder(concat_bev, batch["ego_info"][:, -1, :])
-
+        _, planner = self.decoder(concat_bev, batch["ego_info"][:, -1, :]) # [1, 2, 5]
+        # print(planner.shape)
         return {
-            "control": control_output,                      # control_output shape: [B, 3]
-            "classification": classification_output,        # classification_output shape: [B, num_classes]
-            "future_ego": future_ego,                       # future_ego shape = [B, future_steps, 21]
-            "bev_seg": bev_decoding                         # bev_decoding shape: [B, time_steps, 64, 144, 144]
+            "control": planner,                      # control_output shape: [B, T, 5]
         }
 
 
@@ -221,14 +217,13 @@ def main():
 
             ego_info_future_gt = data["ego_info_future"].to(device) # [B, 2, 12]
             bev_seg_gt = data["gt_hd_map_input"].to(device)         # [B, 8, 200, 200]
+            print(bev_seg_gt.shape)
             traffic_gt = data["traffic"].to(device)                 # [B, C]
             control_gt = data["control"].to(device)                 # [B, 3]
+            
             outputs = model(batch)
-            future_ego = outputs["future_ego"]                      # [B, 2, 12]
-            bev_seg = outputs["bev_seg"]                            # [B, 8, 200, 200]
-            traffic = outputs["classification"]                     # [B, C]
-            control = outputs["control"]                            # [B, 3]       
-            print(f"Batch {batch_idx}: control shape = {control.shape}, classification shape = {traffic.shape}")
+            control = outputs["control"]                            # [B, T, 3]       
+            print(f"Batch {batch_idx}: control shape = {control.shape}")
 
 if __name__ == "__main__":
     main()

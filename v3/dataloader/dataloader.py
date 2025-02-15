@@ -268,16 +268,20 @@ class camDataLoader(Dataset):
                             ego_info_dict["control"].append(float(value))
                         elif key == "trafficlightid":
                             ego_info_dict["trafficlightid"] = value
-            # flatten: 각 키에 대해 값이 없으면 기본값 [0.0, 0.0, 0.0] 사용
+
+            # 기존의 ego_info_data는 그대로 사용
             ego_info_values = []
             for k in ["position", "orientation", "velocity", "control"]:
                 default_length = 3
                 ego_info_values.extend(ego_info_dict.get(k, [0.0] * default_length))
             ego_info_data.append(ego_info_values)
 
-            # control 정보만 따로 저장
-            control_data = ego_info_dict.get("control", [0.0] * 3)
-            control_info_data.append(control_data)
+            # control과 position x,y 정보를 묶어서 저장
+            # position: [x, y, z] 중 x, y만 사용
+            position = ego_info_dict.get("position", [0.0, 0.0, 0.0])
+            control = ego_info_dict.get("control", [0.0] * 3)
+            combined_control_info = [position[0], position[1]] + control
+            control_info_data.append(combined_control_info)
 
             # --- TRAFFIC_INFO 파일 로드 및 traffic classification 결정 (입력 시퀀스에 대해서만) ---
             if t < self.num_timesteps:
@@ -312,8 +316,29 @@ class camDataLoader(Dataset):
         ego_info_tensor = torch.tensor(ego_info_data, dtype=torch.float32)  # (total_steps, feature_dim)
         ego_info_input = ego_info_tensor[:self.num_timesteps]
         ego_info_future = ego_info_tensor[self.num_timesteps:]
-        control_info_tensor = torch.tensor(control_info_data, dtype=torch.float32)
-        control_info_future = control_info_tensor[3,:]
+        
+        base_index = 2
+
+        # 기준 프레임에서 위치 정보 추출 (첫 2개 값)
+        base_position = control_info_data[base_index][:2]
+
+        # 각 프레임에 대해, 위치 정보를 기준 좌표에 대해 상대좌표로 변환합니다.
+        relative_control_info_data = []
+        for frame in control_info_data:
+            # 첫 3개 값(위치)에서 base_position을 빼서 상대좌표 계산
+            relative_position = [frame[i] - base_position[i] for i in range(2)]
+            # 만약 위치 이후에 추가 데이터가 있다면 그대로 유지
+            rest_data = frame[2:]
+            # 새로운 프레임 데이터 생성
+            relative_frame = relative_position + rest_data
+            relative_control_info_data.append(relative_frame)
+
+        # 리스트를 torch.Tensor로 변환 (dtype: float32)
+        control_info_tensor = torch.tensor(relative_control_info_data, dtype=torch.float32)
+
+        # 예시로, self.num_timesteps 이후의 프레임 데이터를 future로 추출 (self.num_timesteps는 클래스 내 변수라고 가정)
+        control_info_future = control_info_tensor[self.num_timesteps:]
+        control_info_future = control_info_tensor[self.num_timesteps:]
         
         # --- 이미지 데이터 (CAMERA) ---
         temporal_images = torch.stack(temporal_images, dim=1)  # (num_cameras, total_steps, C, H, W)
