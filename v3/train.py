@@ -1,7 +1,8 @@
 import os
 import argparse
 import logging
-import math  # 추가: cosine annealing 스케줄러에 필요
+import math  # cosine annealing 스케줄러에 필요
+import warnings
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,6 +10,10 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm  # tqdm import 추가
+
+# 경고 무시 (필요한 경우)
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
+warnings.filterwarnings("ignore", message="Detected call of lr_scheduler.step() before optimizer.step()")
 
 # (기존의 import 구문 유지)
 from models.encoder import Encoder, HDMapFeaturePipeline, FeatureEmbedding, TrafficLightEncoder
@@ -75,10 +80,6 @@ class EndToEndModel(nn.Module):
             middle=[2, 2],
         )
         
-        input_dim = 256
-        hidden_dim = 256
-        output_dim = 256
-        height, width = 25, 25        
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
         self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=7, final_channels=128, final_size=(25, 25))
         self.bev_decoder = Decoder(dim=128, blocks=decoder_blocks, residual=True, factor=2)
@@ -131,7 +132,8 @@ def validate_model(model, dataloader, device, control_loss_fn, seg_loss_fn, logg
             bev_seg_gt = data["gt_hd_map_input"].to(device)
             control_gt = data["control"].to(device)
 
-            with torch.amp.autocast(device_type="cuda"):
+            # positional 인자로 "cuda" 사용 (device_type 인자 대신)
+            with torch.amp.autocast("cuda"):
                 outputs = model(batch)
                 control_pred = outputs["control"]
                 bev_seg_pred = outputs["bev_seg"]
@@ -268,18 +270,29 @@ def train(local_rank, args, distributed=False):
     early_stop_counter = 0
     early_stop_patience = args.early_stop_patience
 
-    # 총 iteration 수와 warmup iteration 설정 (500 iteration 동안 warmup)
+    # 총 iteration 수 및 warmup iteration 설정
     total_iterations = num_epochs * len(train_loader)
-    warmup_iterations = 300
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, 
-        lr_lambda=lambda current_iteration: (current_iteration / warmup_iterations) if current_iteration < warmup_iterations \
-            else 0.5 * (1 + math.cos(math.pi * (current_iteration - warmup_iterations) / (total_iterations - warmup_iterations)))
+    warmup_iterations = 300  # warmup iteration 수
+    cosine_iterations = total_iterations - warmup_iterations
+
+    # warmup: learning rate를 매우 작은 값(1e-3배)에서 시작하여 1.0 배율까지 선형 증가
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_iterations
+    )
+    # cosine annealing: warmup 이후 cosine annealing 적용
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cosine_iterations, eta_min=1e-6
+    )
+    # 두 scheduler를 순차적으로 적용
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_iterations]
     )
     
     model.train()
     iteration = 0
     stop_training = False
+
+    first_step = True 
 
     for epoch in range(num_epochs):
         if distributed:
@@ -307,7 +320,8 @@ def train(local_rank, args, distributed=False):
             gt_indices = torch.argmax(bev_seg_gt, dim=1)
             
             optimizer.zero_grad()
-            with torch.amp.autocast(device_type="cuda"):
+            # "cuda" positional 인자로 autocast 사용
+            with torch.amp.autocast("cuda"):
                 outputs = model(batch)
                 control_pred = outputs["control"]
                 bev_seg_pred = outputs["bev_seg"]
@@ -316,9 +330,15 @@ def train(local_rank, args, distributed=False):
                 loss_seg = seg_loss_fn(bev_seg_pred, gt_indices)
                 loss = loss_control + loss_seg
             
+            # optimizer.step() 후 scheduler.step() 순서 (경고 해결)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            
+            if not first_step: 
+                scheduler.step()
+            
+            first_step = False
             
             running_loss += loss.item()
             running_loss_control += loss_control.item()
@@ -343,7 +363,6 @@ def train(local_rank, args, distributed=False):
                                       f"Ground Truth: {control_gt.detach().cpu().tolist()}")
             
             iteration += 1
-            scheduler.step()  # iteration마다 스케줄러 업데이트
             
             # iteration 단위 validation 수행
             if rank == 0 and iteration % validation_interval == 0:
