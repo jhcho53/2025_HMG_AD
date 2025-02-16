@@ -7,6 +7,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm  # tqdm import 추가
 
 # (기존의 import 구문 유지)
 from models.encoder import Encoder, HDMapFeaturePipeline, FeatureEmbedding, TrafficLightEncoder
@@ -124,7 +125,9 @@ def validate_model(model, dataloader, device, control_loss_fn, seg_loss_fn, logg
     first_sample_logged = False
 
     with torch.no_grad():
-        for data in dataloader:
+        # validation loop에도 tqdm 적용 (진행률 표시)
+        pbar = tqdm(dataloader, desc="Validation", leave=False)
+        for data in pbar:
             batch = {
                 "image": data["images_input"].to(device),
                 "intrinsics": data["intrinsic_input"].to(device),
@@ -279,11 +282,13 @@ def train(local_rank, args, distributed=False):
     for epoch in range(num_epochs):
         if distributed:
             train_sampler.set_epoch(epoch)
+        # tqdm을 사용하여 epoch 내의 배치 진행률 표시
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{num_epochs}")
         running_loss = 0.0
         running_loss_control = 0.0
         running_loss_seg = 0.0
 
-        for batch_idx, data in enumerate(train_loader):
+        for batch_idx, data in pbar:
             if data is None:
                 logger.warning(f"Warning: Skipping batch {batch_idx} due to empty data.")
                 continue
@@ -316,6 +321,13 @@ def train(local_rank, args, distributed=False):
             running_loss += loss.item()
             running_loss_control += loss_control.item()
             running_loss_seg += loss_seg.item()
+            
+            # tqdm progress bar 업데이트 (현재 배치 loss 표시)
+            pbar.set_postfix({
+                "Total Loss": f"{loss.item():.4f}",
+                "Control Loss": f"{loss_control.item():.4f}",
+                "BEV Seg Loss": f"{loss_seg.item():.4f}"
+            })
             
             # 10 배치마다 loss 정보를 training.log에 기록
             if batch_idx % 10 == 0 and rank == 0:
