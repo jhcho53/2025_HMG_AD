@@ -1,6 +1,7 @@
 import os
 import argparse
 import logging
+import math  # 추가: cosine annealing 스케줄러에 필요
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -242,8 +243,8 @@ def train(local_rank, args, distributed=False):
     seg_loss_fn = nn.CrossEntropyLoss()
     
     scaler = torch.amp.GradScaler(device="cuda")
-    # root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample" 
-    root_dir = "/home/vip/hd/Dataset"
+    root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample" 
+    # root_dir = "/home/vip/hd/Dataset"
     dataset = camDataLoader(root_dir, num_timesteps=3)
     
     total_samples = len(dataset)
@@ -261,12 +262,21 @@ def train(local_rank, args, distributed=False):
         val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     
     # hyperparameter: 총 epoch 수, iteration 단위 validation interval
-    num_epochs = getattr(args, "num_epochs", 1)
+    num_epochs = getattr(args, "num_epochs", 20)
     validation_interval = getattr(args, "validation_interval", 100)  # 기본 100 iteration마다 validation
     best_val_loss = float("inf")
     early_stop_counter = 0
     early_stop_patience = args.early_stop_patience
 
+    # 총 iteration 수와 warmup iteration 설정 (500 iteration 동안 warmup)
+    total_iterations = num_epochs * len(train_loader)
+    warmup_iterations = 300
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, 
+        lr_lambda=lambda current_iteration: (current_iteration / warmup_iterations) if current_iteration < warmup_iterations \
+            else 0.5 * (1 + math.cos(math.pi * (current_iteration - warmup_iterations) / (total_iterations - warmup_iterations)))
+    )
+    
     model.train()
     iteration = 0
     stop_training = False
@@ -333,6 +343,8 @@ def train(local_rank, args, distributed=False):
                                       f"Ground Truth: {control_gt.detach().cpu().tolist()}")
             
             iteration += 1
+            scheduler.step()  # iteration마다 스케줄러 업데이트
+            
             # iteration 단위 validation 수행
             if rank == 0 and iteration % validation_interval == 0:
                 logger.info(f"Iteration {iteration}: Running validation...")
@@ -353,6 +365,13 @@ def train(local_rank, args, distributed=False):
                         stop_training = True
                         break  # inner loop 종료
 
+        # epoch 종료 후 모델 저장 (매 epoch마다)
+        if rank == 0:
+            model_state = model.module.state_dict() if distributed else model.state_dict()
+            save_path = f"end_to_end_model_epoch_{epoch+1}.pth"
+            torch.save(model_state, save_path)
+            logger.info(f"Epoch {epoch+1} complete. Model saved to {save_path}.")
+
         if stop_training:
             break
 
@@ -366,10 +385,11 @@ def train(local_rank, args, distributed=False):
             logger.info(f"  Avg Control Loss         : {avg_epoch_control_loss:.4f}")
             logger.info(f"  Avg BEV Seg Loss         : {avg_epoch_seg_loss:.4f}")
 
-    if rank == 0:
+    if rank == 0 and not stop_training:
+        # 최종 모델 저장
         save_dict = model.module.state_dict() if distributed else model.state_dict()
         torch.save(save_dict, "end_to_end_model_test.pth")
-        logger.info("Training complete and model saved.")
+        logger.info("Training complete and final model saved.")
     
     if distributed:
         dist.destroy_process_group()
@@ -384,7 +404,7 @@ if __name__ == "__main__":
                         help="Early stopping patience (number of validations with no improvement).")
     parser.add_argument("--validation_interval", type=int, default=100,
                         help="Run validation every N iterations (default: 100).")
-    parser.add_argument("--num_epochs", type=int, default=1,
+    parser.add_argument("--num_epochs", type=int, default=3,
                         help="Number of training epochs.")
     args = parser.parse_args()
 
