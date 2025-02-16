@@ -2,7 +2,7 @@ import os
 import numpy as np
 import torch
 import cv2
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import re
@@ -12,12 +12,21 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# 파일 핸들러 (로그 파일 저장)
+# 메인 로그 파일 핸들러 (data_loader_debug.log)
 file_handler = logging.FileHandler('data_loader_debug.log')
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
 file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
+
+# 예외 발생한 이미지 경로 전용 로거 설정 (image_error.log)
+error_image_logger = logging.getLogger("image_error_logger")
+error_image_logger.setLevel(logging.ERROR)
+error_file_handler = logging.FileHandler("image_error.log")
+error_file_handler.setLevel(logging.ERROR)
+error_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
+error_file_handler.setFormatter(error_formatter)
+error_image_logger.addHandler(error_file_handler)
 
 # -------------------------------------------------------------------
 # EGO_INFO 파일 내부에서 실제 프레임 번호를 추출하는 함수
@@ -116,13 +125,11 @@ class camDataLoader(Dataset):
             return int(match.group(1)) if match else -1
 
         # 각 시나리오별 데이터(카메라, EGO_INFO, TRAFFIC_INFO) 수집 및 valid index 계산
-        # 전체 시나리오에서 _전체 시퀀스를 구성할 수 있는 시작 인덱스_ (즉, valid sample)만 valid_indices에 등록합니다.
         self.scenario_dirs = []  # valid 시나리오 디렉토리들 (부분적으로 사용)
         self.camera_data = []    # 각 시나리오의 카메라 파일 리스트 (리스트 내에 카메라별 이미지 리스트)
         self.ego_data = []       # 각 시나리오의 필터링된 EGO_INFO 파일 리스트
         self.traffic_data = []   # 각 시나리오의 필터링된 TRAFFIC_INFO 파일 리스트 (없으면 None)
         self.valid_indices = []  # 전체 데이터셋에서 (시나리오 idx, 시작 프레임 인덱스) 튜플 리스트
-        # self.front_data = []
 
         for scenario_dir in all_scenario_dirs:
             logger.debug(f"Processing scenario directory: {scenario_dir}")
@@ -199,7 +206,6 @@ class camDataLoader(Dataset):
                 traffic_entry = None
 
             # 각 시나리오 내에서 전체 total_steps(예: 5) 프레임을 구성할 수 있는 시작 인덱스만 valid하게 사용
-            # (예: num_camera_frames가 100이라면, 시작 인덱스 0 ~ (100 - total_steps) 까지만 사용)
             num_valid_samples = min(num_camera_frames, len(filtered_ego_files)) - self.total_steps + 1
             if num_valid_samples <= 0:
                 logger.warning(f"Not enough frames in scenario {scenario_dir} to form a full sequence. Skipping scenario.")
@@ -210,10 +216,8 @@ class camDataLoader(Dataset):
             self.camera_data.append(camera_files)
             self.ego_data.append(filtered_ego_files)
             self.traffic_data.append(traffic_entry)
-            # self.front_data.append(front_view)
 
             # 해당 시나리오 내에서 각 valid 시작 인덱스를 전역 valid index에 등록
-            # (각 튜플: (해당 valid 시나리오 내 인덱스, 시작 frame index))
             for start_idx in range(num_valid_samples):
                 self.valid_indices.append((len(self.scenario_dirs) - 1, start_idx))
 
@@ -223,7 +227,6 @@ class camDataLoader(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        # valid_indices 매핑을 사용하여 시나리오와 시작 프레임 인덱스를 결정
         try:
             scenario_idx, frame_idx = self.valid_indices[idx]
         except IndexError:
@@ -248,9 +251,10 @@ class camDataLoader(Dataset):
                 try:
                     image = Image.open(image_path).convert("RGB")
                 except (OSError, UnidentifiedImageError) as e:
-                    logger.error(f"Error : {image_path}, Error: {e}")
-                    break
-                
+                    # 예외 발생한 이미지 경로만 별도의 로그 파일에 기록
+                    error_image_logger.error(image_path)
+                    logger.error(f"Error loading image: {image_path}, Error: {e}")
+                    continue
                 image = self.image_transform(image)
                 images_per_camera.append(image)
             temporal_images.append(torch.stack(images_per_camera, dim=0))  # (num_cameras, C, H, W)
@@ -274,15 +278,13 @@ class camDataLoader(Dataset):
                         elif key == "trafficlightid":
                             ego_info_dict["trafficlightid"] = value
 
-            # 기존의 ego_info_data는 그대로 사용
             ego_info_values = []
             for k in ["position", "orientation", "velocity", "control"]:
                 default_length = 3
                 ego_info_values.extend(ego_info_dict.get(k, [0.0] * default_length))
             ego_info_data.append(ego_info_values)
 
-            # control과 position x,y 정보를 묶어서 저장
-            # position: [x, y, z] 중 x, y만 사용
+            # control과 position x,y 정보를 묶어서 저장 (position: [x, y, z] 중 x, y만 사용)
             position = ego_info_dict.get("position", [0.0, 0.0, 0.0])
             control = ego_info_dict.get("control", [0.0] * 3)
             combined_control_info = [position[0], position[1]] + control
@@ -327,22 +329,14 @@ class camDataLoader(Dataset):
         # 기준 프레임에서 위치 정보 추출 (첫 2개 값)
         base_position = control_info_data[base_index][:2]
 
-        # 각 프레임에 대해, 위치 정보를 기준 좌표에 대해 상대좌표로 변환합니다.
+        # 각 프레임에 대해 기준 좌표에 대한 상대좌표 계산
         relative_control_info_data = []
         for frame in control_info_data:
-            # 첫 3개 값(위치)에서 base_position을 빼서 상대좌표 계산
             relative_position = [frame[i] - base_position[i] for i in range(2)]
-            # 만약 위치 이후에 추가 데이터가 있다면 그대로 유지
             rest_data = frame[2:]
-            # 새로운 프레임 데이터 생성
             relative_frame = relative_position + rest_data
             relative_control_info_data.append(relative_frame)
-
-        # 리스트를 torch.Tensor로 변환 (dtype: float32)
         control_info_tensor = torch.tensor(relative_control_info_data, dtype=torch.float32)
-
-        # 예시로, self.num_timesteps 이후의 프레임 데이터를 future로 추출 (self.num_timesteps는 클래스 내 변수라고 가정)
-        control_info_future = control_info_tensor[self.num_timesteps:]
         control_info_future = control_info_tensor[self.num_timesteps:]
         
         # --- 이미지 데이터 (CAMERA) ---
@@ -351,10 +345,9 @@ class camDataLoader(Dataset):
         images_input = temporal_images[:self.num_timesteps]
         images_future = temporal_images[self.num_timesteps:]
 
-        first_camera_images = temporal_images[:, 0, :, :, :]  # Shape: (total_steps, C, H, W)
-        crop_x1, crop_y1, crop_x2, crop_y2 = 50, 50, 150, 150  # 원하는 크롭 좌표 지정
-        first_camera_cropped = first_camera_images[:, :, crop_y1:crop_y2, crop_x1:crop_x2]  # Shape: (total_steps, C, crop_H, crop_W)
-        # front_camera = first_camera_cropped[:self.num_timesteps] 
+        first_camera_images = temporal_images[:, 0, :, :, :]  # (total_steps, C, H, W)
+        crop_x1, crop_y1, crop_x2, crop_y2 = 50, 50, 150, 150
+        first_camera_cropped = first_camera_images[:, :, crop_y1:crop_y2, crop_x1:crop_x2]
 
         # --- Calibration (intrinsic & extrinsic) ---
         intrinsic = torch.stack(self.intrinsic_data, dim=0).unsqueeze(1).repeat(1, self.total_steps, 1, 1)
@@ -415,7 +408,6 @@ class camDataLoader(Dataset):
         crosswalk_color = np.array([0, 255, 0])
         traffic_light_color = np.array([0, 0, 255])
         
-        # 각 채널의 픽셀값이 해당 색상과 정확히 일치하는지 확인
         ego_mask = np.all(hd_map_frame == ego_color, axis=-1).astype(np.float32)
         global_path_mask = np.all(hd_map_frame == global_path_color, axis=-1).astype(np.float32)
         drivable_area_mask = np.all(hd_map_frame == drivable_area_color, axis=-1).astype(np.float32)
@@ -424,7 +416,6 @@ class camDataLoader(Dataset):
         crosswalk_mask = np.all(hd_map_frame == crosswalk_color, axis=-1).astype(np.float32)
         traffic_light_mask = np.all(hd_map_frame == traffic_light_color, axis=-1).astype(np.float32)
         
-        # 7채널 텐서로 스택 (채널 순서: ego, global path, drivable area, white lane, yellow lane, crosswalk, traffic light)
         return np.stack([ego_mask, global_path_mask, drivable_area_mask,
                         white_lane_mask, yellow_lane_mask, crosswalk_mask,
                         traffic_light_mask], axis=0)
@@ -432,9 +423,6 @@ class camDataLoader(Dataset):
     def _load_hd_map(self, scenario_path, frame_indices):
         """
         HD Map 이미지를 불러오고, 파일명을 숫자로 변환해 정렬된 순서로 로드합니다.
-        Args:
-            scenario_path (str): 현재 시나리오 디렉토리.
-            frame_indices (list[int]): 순차적 인덱스 리스트 (0,1,2, ...).
         """
         hd_map_path = os.path.join(scenario_path, self.hd_map_dir)
         if not os.path.exists(hd_map_path):
@@ -472,10 +460,7 @@ class camDataLoader(Dataset):
     def _load_gt_hd_map(self, scenario_path, frame_indices):
         """
         GT_HD_MAP 폴더에서 BEV segmentation GT용 HD Map 이미지를 불러오고,
-        정렬된 순서(오름차순)로 frame_indices에 따라 로드합니다.
-        Args:
-            scenario_path (str): 현재 시나리오 디렉토리.
-            frame_indices (list[int]): 카메라 프레임 인덱스 리스트.
+        정렬된 순서로 frame_indices에 따라 로드합니다.
         """
         gt_hd_map_path = os.path.join(scenario_path, self.gt_hd_map_dir)
         if not os.path.exists(gt_hd_map_path):
@@ -520,7 +505,6 @@ class camDataLoader(Dataset):
         traffic_light_color = np.array([0, 0, 255])
         object_info_color = np.array([128, 0, 128])  # 추가된 Object Info 색상
 
-        # 각 채널의 픽셀값이 해당 색상과 정확히 일치하는지 확인
         ego_mask = np.all(hd_map_frame == ego_color, axis=-1).astype(np.float32)
         global_path_mask = np.all(hd_map_frame == global_path_color, axis=-1).astype(np.float32)
         drivable_area_mask = np.all(hd_map_frame == drivable_area_color, axis=-1).astype(np.float32)
@@ -528,9 +512,8 @@ class camDataLoader(Dataset):
         yellow_lane_mask = np.all(hd_map_frame == yellow_lane_color, axis=-1).astype(np.float32)
         crosswalk_mask = np.all(hd_map_frame == crosswalk_color, axis=-1).astype(np.float32)
         traffic_light_mask = np.all(hd_map_frame == traffic_light_color, axis=-1).astype(np.float32)
-        object_info_mask = np.all(hd_map_frame == object_info_color, axis=-1).astype(np.float32)  # 추가된 Object Info 마스크
+        object_info_mask = np.all(hd_map_frame == object_info_color, axis=-1).astype(np.float32)
 
-        # 8채널 텐서로 스택 (채널 순서: ego, global path, drivable area, white lane, yellow lane, crosswalk, traffic light, object_info)
         return np.stack([ego_mask, global_path_mask, drivable_area_mask,
                         white_lane_mask, yellow_lane_mask, crosswalk_mask,
                         traffic_light_mask, object_info_mask], axis=0)
