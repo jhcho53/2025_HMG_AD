@@ -107,6 +107,15 @@ class EndToEndModel(nn.Module):
 def get_dataloader(dataset, batch_size=16, sampler=None):
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
 
+# --- 추가: 매 validation 시마다 랜덤 서브셋을 생성하는 헬퍼 함수 ---
+def get_random_val_loader(val_dataset, sample_size=32, batch_size=4):
+    """
+    주어진 validation dataset에서 sample_size만큼의 데이터를 무작위로 선택하여 DataLoader를 생성합니다.
+    """
+    indices = torch.randperm(len(val_dataset))[:sample_size].tolist()
+    random_subset = torch.utils.data.Subset(val_dataset, indices)
+    return DataLoader(random_subset, batch_size=batch_size, shuffle=True)
+
 def validate_model(model, dataloader, device, control_loss_fn, seg_loss_fn, logger, val_logger=None, control_logger=None, max_batches=100):
     """
     Validation: control과 segmentation loss를 계산하고, validation 데이터 중 첫 sample의 control 예측 결과를 control_logger에 기록합니다.
@@ -262,11 +271,11 @@ def train(local_rank, args, distributed=False):
     if distributed:
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
         train_loader = DataLoader(train_dataset, batch_size=4, sampler=train_sampler)
-        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        val_loader = DataLoader(val_dataset, batch_size=4, sampler=val_sampler)
+        # 기존 val_loader 대신, validation 시 매번 랜덤 서브셋을 생성합니다.
+        # val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     else:
         train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+        # val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     
     # hyperparameter: 총 epoch 수, iteration 단위 validation interval
     num_epochs = getattr(args, "num_epochs", 20)
@@ -372,8 +381,10 @@ def train(local_rank, args, distributed=False):
             # iteration 단위 validation 수행 (일부 배치만 사용)
             if rank == 0 and iteration % validation_interval == 0:
                 logger.info(f"Iteration {iteration}: Running validation...")
+                # 매 validation 시마다 val_dataset에서 무작위 서브셋으로 DataLoader 생성
+                random_val_loader = get_random_val_loader(val_dataset, sample_size=32, batch_size=4)
                 val_loss, avg_control_loss, avg_seg_loss = validate_model(
-                    model, val_loader, device, control_loss_fn, seg_loss_fn, logger, val_logger, control_logger, max_batches=10
+                    model, random_val_loader, device, control_loss_fn, seg_loss_fn, logger, val_logger, control_logger, max_batches=10
                 )
                 model.train()  # validation 후 train 모드로 전환
 
@@ -427,7 +438,7 @@ if __name__ == "__main__":
     parser.add_argument("--early_stop_patience", type=int, default=4,
                         help="Early stopping patience (number of validations with no improvement).")
     parser.add_argument("--validation_interval", type=int, default=300,
-                        help="Run validation every N iterations (default: 100).")
+                        help="Run validation every N iterations (default: 300).")
     parser.add_argument("--num_epochs", type=int, default=5,
                         help="Number of training epochs.")
     args = parser.parse_args()
