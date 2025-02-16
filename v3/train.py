@@ -107,9 +107,10 @@ class EndToEndModel(nn.Module):
 def get_dataloader(dataset, batch_size=16, sampler=None):
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
 
-def validate_model(model, dataloader, device, control_loss_fn, seg_loss_fn, logger, val_logger=None, control_logger=None):
+def validate_model(model, dataloader, device, control_loss_fn, seg_loss_fn, logger, val_logger=None, control_logger=None, max_batches=100):
     """
     Validation: control과 segmentation loss를 계산하고, validation 데이터 중 첫 sample의 control 예측 결과를 control_logger에 기록합니다.
+    전체 데이터셋 대신, 지정된 배치 수(max_batches)만 처리합니다.
     """
     model.eval()
     total_loss = 0.0
@@ -121,7 +122,11 @@ def validate_model(model, dataloader, device, control_loss_fn, seg_loss_fn, logg
     with torch.no_grad():
         # validation loop에도 tqdm 적용 (진행률 표시)
         pbar = tqdm(dataloader, desc="Validation", leave=False)
-        for data in pbar:
+        for batch_idx, data in enumerate(pbar):
+            # 지정한 배치 수만 validation 진행
+            if batch_idx >= max_batches:
+                break
+
             batch = {
                 "image": data["images_input"].to(device),
                 "intrinsics": data["intrinsic_input"].to(device),
@@ -245,7 +250,7 @@ def train(local_rank, args, distributed=False):
     seg_loss_fn = nn.CrossEntropyLoss()
     
     scaler = torch.amp.GradScaler(device="cuda")
-    root_dir = "/home/vip/2025_HMG_AD/v2/Dataset_sample" 
+    root_dir = "/workspace/dataset" 
     # root_dir = "/home/vip/hd/Dataset"
     dataset = camDataLoader(root_dir, num_timesteps=3)
     
@@ -364,11 +369,11 @@ def train(local_rank, args, distributed=False):
             
             iteration += 1
             
-            # iteration 단위 validation 수행
+            # iteration 단위 validation 수행 (일부 배치만 사용)
             if rank == 0 and iteration % validation_interval == 0:
                 logger.info(f"Iteration {iteration}: Running validation...")
                 val_loss, avg_control_loss, avg_seg_loss = validate_model(
-                    model, val_loader, device, control_loss_fn, seg_loss_fn, logger, val_logger, control_logger
+                    model, val_loader, device, control_loss_fn, seg_loss_fn, logger, val_logger, control_logger, max_batches=10
                 )
                 model.train()  # validation 후 train 모드로 전환
 
@@ -419,11 +424,11 @@ if __name__ == "__main__":
                         help="Local rank. Provided by distributed launcher if using distributed training.")
     parser.add_argument("--distributed", action="store_true",
                         help="Enable distributed training across multiple GPUs.")
-    parser.add_argument("--early_stop_patience", type=int, default=2,
+    parser.add_argument("--early_stop_patience", type=int, default=4,
                         help="Early stopping patience (number of validations with no improvement).")
-    parser.add_argument("--validation_interval", type=int, default=100,
+    parser.add_argument("--validation_interval", type=int, default=300,
                         help="Run validation every N iterations (default: 100).")
-    parser.add_argument("--num_epochs", type=int, default=3,
+    parser.add_argument("--num_epochs", type=int, default=5,
                         help="Number of training epochs.")
     args = parser.parse_args()
 
