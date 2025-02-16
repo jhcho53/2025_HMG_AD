@@ -245,7 +245,12 @@ class camDataLoader(Dataset):
             for cam_idx in range(len(camera_files)):
                 image_path = camera_files[cam_idx][frame_idx + t]
                 logger.debug(f"Loading image file: {image_path}")
-                image = Image.open(image_path).convert("RGB")
+                try:
+                    image = Image.open(image_path).convert("RGB")
+                except (OSError, UnidentifiedImageError) as e:
+                    logger.error(f"Error : {image_path}, Error: {e}")
+                    break
+                
                 image = self.image_transform(image)
                 images_per_camera.append(image)
             temporal_images.append(torch.stack(images_per_camera, dim=0))  # (num_cameras, C, H, W)
