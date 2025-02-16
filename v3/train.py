@@ -77,17 +77,9 @@ class EndToEndModel(nn.Module):
         input_dim = 256
         hidden_dim = 256
         output_dim = 256
-        height, width = 25, 25
-        self.bev_gru = BEVGRU(input_dim, hidden_dim, output_dim, height, width)
-        
+        height, width = 25, 25        
         self.feature_embedding = FeatureEmbedding(hidden_dim=32, output_dim=16)
-        self.ego_gru = EgoStateGRU(input_dim=176, hidden_dim=256, output_dim=256, num_layers=1)
-        self.ego_fusion = BEV_Ego_Fusion()
         self.hd_map_pipeline = HDMapFeaturePipeline(input_channels=7, final_channels=128, final_size=(25, 25))
-        self.traffic_encoder = TrafficLightEncoder(feature_dim=128, pretrained=True)
-        self.classification_head = TrafficSignClassificationHead(input_dim=128, num_classes=10)
-        self.control = ControlMLP(future_steps=2, control_dim=3)
-        self.ego_header = EgoStateHead(input_dim=256, hidden_dim=128, output_dim=21)
         self.bev_decoder = Decoder(dim=128, blocks=decoder_blocks, residual=True, factor=2)
         self.decoder = PlannerModule(embed_dims=256, num_reg_fcs=2, 
                                      ego_fut_mode=3, fut_steps=2)
