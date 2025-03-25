@@ -13,7 +13,7 @@ def setup_ddp(rank, world_size):
     DDP 환경 초기화.
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"  # 포트 번호는 사용 가능한 것으로 설정
+    os.environ["MASTER_PORT"] = "12355"  
     torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 def cleanup_ddp():
@@ -28,7 +28,7 @@ def train(rank, world_size):
     """
     setup_ddp(rank, world_size)
 
-    # 데이터 및 DataLoader 설정
+    # Dataloader
     base_root = "/home/vip/hd/Dataset"
     map_name = "R_KR_PG_KATRI__HMG"
     camera_dirs = ["CAMERA_1", "CAMERA_2", "CAMERA_3", "CAMERA_4", "CAMERA_5"]
@@ -38,7 +38,7 @@ def train(rank, world_size):
         base_root=base_root,
         map_name=map_name,
         camera_dirs=camera_dirs,
-        batch_size=1,  # 각 GPU에서 처리할 배치 크기
+        batch_size=1,  
         hd_map_dir=hd_map_dir,
         img_size=(144, 256),
         time_steps=2,
@@ -49,11 +49,10 @@ def train(rank, world_size):
         print("No scenarios found!")
         return
 
-    # 시나리오 나누기: 각 GPU에 다른 시나리오 할당
+    # 시나리오 나누기
     scenario_paths = loader.scenario_paths
     local_scenario_paths = scenario_paths[rank::world_size]  # GPU별 시나리오 분배
 
-    # 모델 및 학습 설정
     device = torch.device(f"cuda:{rank}")
     model = CombinedModel().to(device)
     model = DDP(model, device_ids=[rank])
@@ -62,19 +61,17 @@ def train(rank, world_size):
     criterion = nn.MSELoss()
     scaler = GradScaler()
 
-    num_epochs = 2  # 에폭 설정
+    num_epochs = 2 
 
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
 
-        # GPU마다 할당된 시나리오 학습
         for scenario_path in local_scenario_paths:
             loader.set_scenario(scenario_path)
             print(f"[Rank {rank}] Epoch [{epoch+1}/{num_epochs}] - Scenario: {scenario_path}")
 
             for batch_idx, (camera_images, intrinsics, extrinsics, hd_map_tensors, ego_inputs, target) in enumerate(loader):
-                # 데이터 장치로 이동
                 camera_images = camera_images.to(device, non_blocking=True)
                 intrinsics = intrinsics.to(device, non_blocking=True)
                 extrinsics = extrinsics.to(device, non_blocking=True)
@@ -99,14 +96,13 @@ def train(rank, world_size):
                           f"Batch [{batch_idx+1}/{len(loader)}], "
                           f"Loss: {loss.item():.6f}")
 
-        # 에폭 종료 후 로그 출력
         avg_loss = running_loss / len(loader)
         print(f"[Rank {rank}] Epoch [{epoch+1}/{num_epochs}] Complete: Average Loss: {avg_loss:.6f}")
 
-        # 모델 저장 (Rank 0에서만 저장)
+        # save model
         if rank == 0:
             save_path = f"model_epoch_{epoch+1}.pth"
-            torch.save(model.module.state_dict(), save_path)  # DDP에서는 model.module 사용
+            torch.save(model.module.state_dict(), save_path)  
             print(f"[Rank {rank}] Model saved at {save_path}")
             
     cleanup_ddp()
